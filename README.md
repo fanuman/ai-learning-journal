@@ -11,7 +11,7 @@ One commit per day, every weekday.
 
 | Week | Theme | Status |
 |------|-------|--------|
-| 1 | LLM foundations, prompting, environment | ✅ |
+| 1 | LLM foundations, prompting, environment | ⬜ |
 | 2 | Embeddings, vector search, RAG basics | ⬜ |
 | 3 | Advanced RAG, frameworks, frontend | ⬜ |
 | 4 | Agents, AWS fundamentals, Month 1 capstone | ⬜ |
