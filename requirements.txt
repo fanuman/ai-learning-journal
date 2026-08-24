@@ -11,6 +11,7 @@ httpcore2==2.10.0
 httpx2==2.10.0
 idna==3.18
 jiter==0.16.0
+numpy==2.5.2
 openai==3.0.0
 pydantic==2.13.4
 pydantic_core==2.46.4
