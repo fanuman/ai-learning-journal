@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>RAG Chat</title>
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 40px auto; }
+        #chat { border: 1px solid #ccc; padding: 20px; min-height: 200px; white-space: pre-wrap; }
+        input { width: 80%; padding: 8px; }
+        button { padding: 8px 16px; }
+    </style>
+</head>
+<body>
+    <div id="chat"></div>
+    <input id="message" type="text" placeholder="Ask a question..." />
+    <button onclick="sendMessage()">Send</button>
+
+    <script>
+
+        document.getElementById('message').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') sendMessage();
+        });
+
+        let conversationHistory = [
+            { role: "system", content: "You are a helpful assistant." }
+        ];
+
+        async function sendMessage() {
+            const input = document.getElementById('message');
+            const button = document.querySelector('button');
+            const chat = document.getElementById('chat');
+            const message = input.value;
+            if (!message.trim()) return;   // ignore empty sends
+
+            input.value = '';
+            chat.innerHTML += `\n\nYou: ${message}\nAssistant: `;
+
+            conversationHistory.push({ role: "user", content: message });
+
+            // Disable before the request starts, not after - otherwise there's a
+            // window where a fast double-click could fire two overlapping requests
+            input.disabled = true;
+            button.disabled = true;
+            button.textContent = 'Thinking...';
+
+            try {
+                const response = await fetch('http://localhost:8000/chat/stream', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ messages: conversationHistory })
+                });
+
+                const reader = response.body.getReader();
+                const decoder = new TextDecoder();
+                let assistantReply = '';
+
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) break;
+                    const chunk = decoder.decode(value);
+                    for (const line of chunk.split('\n\n')) {
+                        if (line.startsWith('data: ')) {
+                            const content = line.slice(6);
+                            if (content === '[DONE]') continue;
+                            chat.innerHTML += content;
+                            assistantReply += content;
+                        }
+                    }
+                }
+
+                conversationHistory.push({ role: "assistant", content: assistantReply });
+
+            } finally {
+                // Runs whether the stream finished cleanly, threw a network error,
+                // or the server returned an error mid-stream - the input should
+                // never stay stuck disabled just because something went wrong
+                input.disabled = false;
+                button.disabled = false;
+                button.textContent = 'Send';
+                input.focus();
+            }
+        }
+        
+    </script>
+</body>
+</html>
