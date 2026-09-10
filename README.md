@@ -24,3 +24,10 @@ Update the status column as you finish each week (⬜ → ✅).
 
 ## Structure
 Each day gets its own folder: `week-XX/day-YY/notes.md` + `practice/` for that day's coding task.
+
+## Cleanup checklist (end of roadmap)
+
+Live AWS resources to tear down once the roadmap is fully complete, so nothing keeps running
+(or costing) after the learning is done:
+
+- [ ] Lambda function `production-rag-chat` + its API Gateway HTTP API (Day 18)
