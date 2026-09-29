@@ -1,95 +1,158 @@
-# Day 31 - Multi-agent orchestration: LangGraph, a Researcher + Writer pipeline
+# Day 32 - Kubernetes fundamentals: local cluster, self-healing, a real missing-data bug
 
 **Date completed:** _(fill in)_
 
 ## What I learned
 
-**An agent with tools isn't the same thing as a multi-agent system.** `RAGPipeline`'s ReAct loop
-(Day 16) is one agent, one prompt, deciding whether to call a tool and repeating until done.
-Multi-agent orchestration is a different idea: multiple distinct *roles*, each with its own
-narrower prompt and responsibility, handing off structured state between them - specialists
-collaborating, not one generalist doing everything.
+**Kubernetes exists to solve a problem Docker Compose never had to: running containers across
+many machines, not just one.** Compose orchestrates containers on a single host you already
+manage by hand. Kubernetes assumes a *cluster* of machines and continuously reconciles a declared
+desired state against it - rescheduling failed containers, tracking which node has capacity,
+giving containers a stable network identity as they move, and rolling out updates - none of which
+is a single-host problem in the first place.
 
-**LangGraph's core primitives**, replacing the hand-rolled `for` loop from Day 16:
-- **State** - a shared object (`TypedDict` here) flowing through every node
-- **Nodes** - plain functions, each reading state and returning an updated state
-- **Edges** - how control moves between nodes (`add_edge` for a fixed handoff today; conditional
-  edges exist for branching, not needed for a straight two-step pipeline)
-- **`StateGraph(...).compile()`** - turns nodes + edges into something runnable via `.invoke()`
+**The core objects, and why each one exists:**
+- **Pod** - the smallest deployable unit (one or more tightly-coupled containers sharing network/
+  storage). Rarely created directly.
+- **Deployment** - wraps Pods with a live reconciliation loop: declare "3 replicas of this Pod
+  spec" and Kubernetes continuously enforces it, replacing any Pod that dies without being asked
+  to do so again. This is *not* Compose's `restart: always` (which only restarts a container in
+  place) - a Deployment can reschedule onto a different node entirely, and the replacement is a
+  genuinely new Pod, not the same one restarted.
+- **Service** - a stable DNS name over a set of Pods, addressing the same "container network
+  identity" problem ECS Fargate's `localhost`-sidecar trick only partially solved. Pods are
+  ephemeral and get new IPs constantly; a Service doesn't change even as the Pods behind it do.
 
-**Two genuinely different multi-agent topologies exist, not just one "multi-agent pattern":**
-a **pipeline** (fixed sequence, every request flows through every stage - today's Researcher then
-Writer) versus a **router** (one orchestrator classifies a request and sends it to exactly one of
-several specialists, each running its own independent loop). Confirmed this distinction directly
-today after finding an old orchestrator/specialist exercise (billing/technical/general triage) from
-earlier in this same project's history that never actually became this repo's real Day 21 - Day 21
-here was genuinely Docker Compose, confirmed by real terminal output and the README. Decided to add
-the router pattern as a second exercise on Saturday, on top of today's pipeline, rather than
-treating the two as competing options - they're genuinely different tools for different shapes of
-problem.
+**The declarative model, confirmed by actually watching it work today**: you don't tell
+Kubernetes "restart this container" - you declare desired state (a Deployment's replica count, a
+Pod spec) and a controller continuously reconciles reality toward it, forever, not just once at
+apply time. `kubectl apply` isn't a one-shot imperative command the way `terraform apply` mostly
+is; it's closer to *registering* a desired state that keeps being enforced afterward.
+
+**Local vs. production Kubernetes cost model, genuinely different from ECS**: Minikube is free -
+a single-node cluster running on your own machine, useful for exactly this kind of learning
+exercise. Production-managed Kubernetes (AWS EKS) charges a flat **$0.10/hour per cluster for the
+control plane alone** (~$73/month, continuous, regardless of workload) - a real difference from
+ECS/Fargate's no-separate-cluster-fee model, and directly relevant to this project's established
+"destroy between sessions" cost discipline once Day 33 (EKS) actually stands one up.
 
 ## Today's exercise
 
-New `src/agents/` module (own module, not folded into `rag/` - the two agents here don't touch the
-live chat pipeline at all):
-- `state.py` - `ContentState` TypedDict: `topic`, `research_notes`, `sources`, `draft`
-- `researcher.py` - `researcher_node()`: retrieves from the same Chroma collection the chatbot
-  already uses, then extracts *plain factual bullet points only* - deliberately no marketing
-  language, no prose. Keeping this node's job narrow (facts, not copy) is what makes the split
-  real rather than one agent's logic arbitrarily divided into two functions.
-- `writer.py` - `writer_node()`: takes only the Researcher's notes and drafts a customer-facing
-  buying-guide paragraph. Never touches the vectorstore directly - a wrong fact is the
-  Researcher's bug to fix, not something the Writer should guess around.
-- `graph.py` - wires `researcher -> writer -> END` with `StateGraph`, exposes `run_content_pipeline(topic)`
+Installed `minikube` + `kubectl` via Homebrew (a slow one - an outdated Xcode Command Line Tools
+version meant no precompiled bottle matched, so several dependencies built from source, 40+
+minutes total; two non-fatal `brew link` conflicts at the end - a `kubectl` symlink clash with
+Docker Desktop's own bundled copy, and a bash-completion file - neither affected the actual
+binaries). Started a local single-node cluster:
+```bash
+minikube start
+```
 
-Added `langgraph` to `requirements.txt`.
+Wrote three Deployment+Service manifest pairs under `infra/k8s/` - `redis.yaml`, `chroma.yaml`,
+`app.yaml` - mirroring the same three-container shape already defined in `docker-compose.yml` and
+`infra/terraform/ecs.tf`. The one genuinely new piece versus both of those: `app.yaml` addresses
+its dependencies as `CHROMA_HOST: "chroma"` / `REDIS_HOST: "redis"` - real Kubernetes Service DNS
+names - rather than Compose's own `"redis"`/`"chroma"` (Compose's built-in DNS) or ECS's
+`"localhost"` (containers sharing one Fargate task's network interface). Three different
+container-runtime environments, three different answers to the same "how do sibling containers
+find each other" question. The OpenAI key came from a Kubernetes Secret:
+```bash
+kubectl create secret generic openai-secret --from-literal=OPENAI_API_KEY=...
+```
+read into the app container via `secretKeyRef` - conceptually the same idea as ECS's Secrets
+Manager injection, just Kubernetes' own native mechanism instead of an AWS-specific one.
 
-## Test results - the honesty test was the real point
+## Two real problems hit and fixed, not scripted
 
-Ran two topics through the compiled graph, inside Docker Compose
-(`docker compose exec app python -m src.agents.graph "<topic>"`, needed a `--build` first since
-`langgraph` is a new dependency):
+**1. `docker build` failed against Minikube's Docker daemon** - `eval $(minikube docker-env)`
+followed by a normal `docker build` errored with `404 page not found` while "booting buildkit."
+Root cause: this Minikube cluster runs the newer `containerd` runtime by default, and
+`minikube docker-env` faking a Docker socket over that is explicitly flagged by Minikube itself as
+"highly experimental." Fix: skip `docker-env` + `docker build` entirely and use Minikube's own
+build path instead, which works regardless of the underlying runtime:
+```bash
+minikube image build -t production-rag-agent:local -f infra/Dockerfile .
+```
 
-**"winter camping tents"** - deliberately the same topic Day 27's `context_recall` flagged as a
-real, unresolved content gap (no tent in the catalog is actually winter-rated). The Researcher's
-notes surfaced the limitation as a plain fact ("not fully supported... a 4-season tent is
-recommended for winter mountaineering") rather than omitting it, and the Writer's draft led with
-that honest caveat rather than writing around it into false marketing copy. This was the test that
-actually mattered - confirming a known real limitation survives a two-LLM-call handoff intact,
-rather than getting lost or spun somewhere in the pipeline.
+**2. A real, previously-invisible gap: the Dockerfile never copied `data/` into the image at
+all.** `docker-compose.yml` bind-mounts `./data` from the host, which silently papered over this
+the entire project - the image itself has never actually contained the product catalog. Only
+surfaced today because Kubernetes has no equivalent to a host bind mount: a Pod runs inside the
+cluster, with zero access to the Mac's filesystem. Confirmed directly:
+```bash
+kubectl exec -it deploy/app -- ls -la /app/data
+# ls: cannot access '/app/data': No such file or directory
+```
+which explained an earlier `ValueError: Expected Embeddings to be non-empty list ... got []`
+during ingestion - zero data files found, zero chunks, zero embeddings to add. Fixed with one
+added line in `infra/Dockerfile`:
+```dockerfile
+COPY src/ ./src/
+COPY data/ ./data/
+```
+**A real open question this raises**: since the exact same Dockerfile builds the production ECS
+image, it's worth checking whether the ECS deployment has quietly had this same gap the whole
+time, only ever masked by however ingestion actually happened there. Not chased down today -
+flagged for later.
 
-**"rain jackets"** - clean positive case. Every claim in the final draft (waterproof rating,
-breathability, care instructions, the cold-weather limit) traces back to a real bullet in the
-Researcher's notes - confirmed the Writer's "use only these facts" instruction actually held, no
-fabricated specs.
+**A genuine Kubernetes gotcha surfaced by the rebuild**: re-running `minikube image build` with
+the same tag does *not* make an already-running Pod pick up the new image - `imagePullPolicy`
+defaults to `IfNotPresent` for any tag other than `latest`, so a live Pod just keeps its old image
+indefinitely. Had to explicitly force a new Pod:
+```bash
+kubectl rollout restart deployment/app
+```
 
-Both runs stayed on `gpt-4o-mini` throughout - cheap to iterate on repeatedly.
+## A live demonstration of the startup-ordering gap Compose's `depends_on` doesn't solve
 
-## A real project-history mix-up, resolved honestly
+Right after `kubectl apply`, the `app` Pod crash-looped several times
+(`redis.exceptions.ConnectionError: ... connecting to redis:6379. Connection refused.`) while
+Redis and Chroma were still mid-image-pull (`ContainerCreating`). Not a bug - `RAGPipeline`
+connects to both at startup, and Kubernetes had no way to know Redis wasn't *ready* yet, only that
+its Pod had been scheduled. Compose's `depends_on` has this exact same limitation (it controls
+start order, not readiness) - Kubernetes' actual fix for this (readiness probes + `initContainers`)
+wasn't built today, just observed and understood. Once both dependencies genuinely finished
+starting, the `app` Pod's next automatic restart succeeded on its own - no manual intervention
+needed, which is itself the underlying self-healing mechanism already doing its job.
 
-Found an old orchestrator/specialist exercise (billing/technical/general classify-and-route,
-`multiagent-platform` repo, labeled "Day 21") that didn't match this project's actual, confirmed
-history - real Day 21 here was Docker Compose. Traced it as far as verifiable: checked this
-session's own transcript for earlier mentions and found none, meaning it's genuinely unclear
-whether that exercise happened earlier in this same project's history and simply wasn't preserved
-through a context-compaction summary, or came from confusion with a different session entirely.
-Resolved pragmatically rather than left unresolved: whatever its origin, it didn't become this
-repo's real Day 21, and its actual technique (structured-output routing to independent specialist
-loops) is worth doing on its own merits - added to Saturday's project instead of relitigating where
-it came from.
+## Test results
+
+**Full pipeline, working end-to-end on Kubernetes:**
+```bash
+curl -X POST http://127.0.0.1:<minikube-tunnel-port>/ask \
+  -H "Content-Type: application/json" -d '{"message": "What is the return policy?"}'
+```
+```json
+{"reply":"The return policy allows most items to be returned within 30 days...",
+ "sources":["returns_policy.txt"], "used_fallback":false, "from_cache":false}
+```
+Correctly grounded, real sources, no fallback - confirming retrieval, embeddings, Chroma, and the
+full agent loop all work identically to Compose once the missing-data bug was actually fixed.
+
+**Self-healing, demonstrated directly rather than just described:**
+```bash
+kubectl delete pod app-5f4bb747d5-wksj4
+kubectl get pods -w
+# app-5f4bb747d5-d9xqv   1/1   Running   0   7s
+```
+A replacement Pod was `Running` again within 7 seconds of deletion, with zero manual action beyond
+watching it happen - the Deployment's reconciliation loop doing exactly what it's declared to do.
 
 ## Questions / things that confused me
 - _(fill in anything still fuzzy)_
-- Whether to eventually combine both topologies - e.g., an orchestrator that could route a request
-  to *either* the single-agent chat pipeline *or* the researcher/writer content pipeline, depending
-  on what kind of request it is - once the router pattern exists on Saturday
+- Whether the ECS production deployment has the same missing-`data/`-in-image gap, and if so, how
+  ingestion there has actually been working
+- What a real readiness-probe + `initContainers` fix for the startup-ordering problem would look
+  like, versus just tolerating the crash-loop-then-recover behavior seen today
 
 ## Practice task
-Built a genuine two-agent LangGraph pipeline (Researcher + Writer) as a new, standalone
-`src/agents/` module, generating customer-facing buying-guide content from the same product
-catalog the live chatbot already uses. Confirmed the split is real, not cosmetic: a previously-
-documented content gap (no winter-rated tent) survived the handoff between both agents honestly,
-and the Writer's output stayed fully grounded in the Researcher's facts with no fabrication.
-Decided to add a second multi-agent topology (orchestrator + independent specialists) as a
-follow-on exercise this Saturday, alongside the EKS deployment work already planned for Week 7's
-project.
+Stood up a local Minikube cluster and deployed the three-container stack (`app`, `chroma`,
+`redis`) as Kubernetes Deployments + Services, translating Compose's DNS-name assumptions
+(`"redis"`/`"chroma"`) into Kubernetes Service names and ECS's Secrets-Manager-injection pattern
+into a native Kubernetes Secret. Hit and resolved two genuine problems along the way rather than
+following a scripted happy path: a Minikube/containerd-specific `docker build` failure (fixed via
+`minikube image build`), and a real, previously-undetected bug where the Dockerfile never actually
+copied `data/` into the image at all - only ever masked by Compose's bind mount, and only surfaced
+because Kubernetes Pods have no equivalent access to the host filesystem. Watched the app crash-
+loop against not-yet-ready dependencies and recover on its own once they came up, then confirmed
+the deployment fully works end-to-end with a real grounded RAG answer, and demonstrated self-
+healing directly by deleting a Pod and watching Kubernetes replace it in 7 seconds.
