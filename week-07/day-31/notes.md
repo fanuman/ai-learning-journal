@@ -78,11 +78,131 @@ repo's real Day 21, and its actual technique (structured-output routing to indep
 loops) is worth doing on its own merits - added to Saturday's project instead of relitigating where
 it came from.
 
+## Router pattern - documented, not built (a deliberate Week 7 Saturday decision)
+
+Originally planned to build the orchestrator/specialist router as a second hands-on exercise this
+Saturday, on top of the pipeline above. Revisited that plan once Week 7's project actually started:
+Week 8's capstone (`week-08-capstone-plan.md`) already commits to LangGraph as a core, first-class
+tool from day one, which is exactly where conditional-edge routing would get real, sustained
+practice. Building a second, lighter LangGraph exercise this Saturday just to touch the same
+primitive once would be duplicated effort - better to bank the concept precisely in writing now and
+get the hands-on repetition when it's actually load-bearing for the capstone's design. The
+EKS deployment work moved into the time this freed up.
+
+**The concept, for the record:**
+
+A **router** differs from today's **pipeline** in exactly one structural way: today's graph is
+`researcher -> writer -> END`, a fixed sequence where every request visits every node in the same
+order. A router is a *branch*, not a sequence - one orchestrator node classifies an incoming
+request (via structured output, e.g. a Pydantic model naming `billing` / `technical` / `general`),
+and that classification decides which *one* of several independent specialist nodes the request
+goes to next. The other specialists never run at all for that request.
+
+In LangGraph terms, this is what **conditional edges** are for, as opposed to today's `add_edge`
+fixed handoff: a node's return value (the classification) picks which edge the graph actually
+follows, via `add_conditional_edges` mapping classification values to destination nodes. Each
+specialist can be as independent as the Researcher/Writer nodes were today - its own prompt, its
+own tools, its own narrow responsibility - the only new idea is that which specialist runs is
+decided at runtime instead of fixed at graph-definition time.
+
+This is also the resolution to the old `multiagent-platform` billing/technical/general exercise
+found in project history (see above): its actual technique - structured-output classification routed
+to independent specialist loops - is a real router pattern and conceptually correct, it's just not
+being rebuilt as code in *this* project. The concept transfers; the implementation is deliberately
+deferred to Week 8.
+
+### The pattern in code (illustrative only - not part of this project's pipeline)
+
+Stripped down to its simplest possible form, a router is just a classification call followed by an
+`if`/`elif`/`else`. Using the billing/technical/general categories from the old exercise:
+
+```python
+from enum import Enum
+from pydantic import BaseModel
+from openai import OpenAI
+
+client = OpenAI()
+
+
+class RequestCategory(str, Enum):
+    BILLING = "billing"
+    TECHNICAL = "technical"
+    GENERAL = "general"
+
+
+class Classification(BaseModel):
+    category: RequestCategory
+    reasoning: str
+
+
+def classify_request(user_message: str) -> Classification:
+    """The orchestrator's only job: decide which specialist should handle this.
+    Nothing else - no answering, no tool calls, just routing."""
+    response = client.beta.chat.completions.parse(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Classify the customer's message into exactly one category: "
+                    "billing, technical, or general. Give a one-sentence reason."
+                ),
+            },
+            {"role": "user", "content": user_message},
+        ],
+        response_format=Classification,
+    )
+    return response.choices[0].message.parsed
+
+
+def handle_billing(user_message: str) -> str:
+    # Its own narrow prompt + its own tools, e.g. look_up_order(), issue_refund()
+    # A full ReAct loop in its own right - not a shared one with technical/general.
+    ...
+
+
+def handle_technical(user_message: str) -> str:
+    # Its own narrow prompt + its own tools, e.g. search_docs(), check_product_spec()
+    ...
+
+
+def handle_general(user_message: str) -> str:
+    # No specialist needed - falls back to the existing RAG pipeline from Day 8/16.
+    ...
+
+
+def route_request(user_message: str) -> str:
+    """The router itself: classify, then branch to exactly one specialist."""
+    classification = classify_request(user_message)
+
+    if classification.category == RequestCategory.BILLING:
+        return handle_billing(user_message)
+    elif classification.category == RequestCategory.TECHNICAL:
+        return handle_technical(user_message)
+    else:  # RequestCategory.GENERAL
+        return handle_general(user_message)
+```
+
+**Why this is the same thing as LangGraph's `add_conditional_edges`, not a simpler substitute for
+it**: `add_conditional_edges` takes a function that returns a string, and a dict mapping each
+possible string to a destination node - which is exactly what the `if`/`elif`/`else` above does by
+hand. LangGraph doesn't add a new idea here; it formalizes an ordinary dispatch pattern as a graph
+edge so that state threading, composing it with other nodes (a pipeline *and* a router in the same
+graph), and visualizing the whole thing come for free. The router pattern itself - classify once,
+branch to exactly one independent handler - is a general software pattern with or without any
+framework at all. That's the part worth remembering cold; the LangGraph syntax for it is the part
+Week 8 will actually drill.
+
+Each `handle_*` stub above would, in a real build, be a complete ReAct loop with its own tools - the
+same shape as `RAGPipeline`'s agent from Day 16 - just scoped to one category's concerns instead of
+being one generalist prompt trying to handle everything.
+
 ## Questions / things that confused me
 - _(fill in anything still fuzzy)_
 - Whether to eventually combine both topologies - e.g., an orchestrator that could route a request
   to *either* the single-agent chat pipeline *or* the researcher/writer content pipeline, depending
-  on what kind of request it is - once the router pattern exists on Saturday
+  on what kind of request it is - this is now explicitly a Week 8 question, not a Week 7 one, since
+  the router pattern itself is deferred there
 
 ## Practice task
 Built a genuine two-agent LangGraph pipeline (Researcher + Writer) as a new, standalone
@@ -90,6 +210,8 @@ Built a genuine two-agent LangGraph pipeline (Researcher + Writer) as a new, sta
 catalog the live chatbot already uses. Confirmed the split is real, not cosmetic: a previously-
 documented content gap (no winter-rated tent) survived the handoff between both agents honestly,
 and the Writer's output stayed fully grounded in the Researcher's facts with no fabrication.
-Decided to add a second multi-agent topology (orchestrator + independent specialists) as a
-follow-on exercise this Saturday, alongside the EKS deployment work already planned for Week 7's
-project.
+Initially planned a second multi-agent topology (orchestrator + independent specialists) as a
+hands-on follow-on exercise this Saturday, then deliberately deferred the actual build to Week 8
+(where LangGraph conditional edges get real, sustained practice as a core tool) - documented the
+concept precisely instead, including a plain `if`/`elif`/`else` version of the same router logic to
+make concrete exactly what `add_conditional_edges` formalizes into a graph edge.
