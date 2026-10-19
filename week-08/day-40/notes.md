@@ -646,3 +646,750 @@ if __name__ == "__main__":
     for qref, iref, total, dtype, code, var in report:
         print(f"  {iref} vs {qref}: total variance {total:,} -> {dtype} {code} {var:+,}")
 ```
+
+
+
+# Day 42 - Human review (pause and resume a graph) and the CI evaluation gate
+
+Status: code done and pushed. Part 1 = concepts and a toy. Part 2 = the review step in the real graph. Part 3 = a CI workflow with a quality gate.
+CI first run on GitHub: **(fill in: green / what failed and the fix)**.
+
+## The problem this solves
+Until today `needs_review` was a dead end: the pipeline set a flag and stopped, and nobody could act on it. A real review flow needs three things:
+1. the graph stops at the exact point where it needs a person,
+2. it remembers everything it knew, for minutes or days, even across a server restart,
+3. when the person answers, it carries on from there.
+
+This keeps the project principle: *the LLM reads, software decides* - and now a person can override. The person is not trusted blindly either: a correction goes through the same `validate()` as the model's reading.
+Second half of the day: code that quietly breaks is the next problem, so a robot (CI) runs the tests and a quality gate on every push.
+
+---
+
+# Part 1 - Concepts
+
+## Glossary
+- **Checkpoint.** A snapshot of the graph's whole state, saved after every step. (Django analogy: saving a model row after each stage of a wizard.)
+- **Checkpointer.** The component that stores checkpoints. `MemorySaver` keeps them in the Python process's memory (right for tests; lost when the process stops). Production needs a database-backed one such as `PostgresSaver`.
+- **Thread (`thread_id`).** The name of one run's saved history. One document = one thread. Two thread ids never see each other's state. Passed as `config={"configurable": {"thread_id": "..."}}`.
+- **`interrupt(value)`.** Called inside a node. The graph stops right there, saves a checkpoint, and hands `value` to whoever called `invoke()`. Think of `input()` that can wait for days and survive a restart.
+- **`Command(resume=answer)`.** What you pass to `invoke()` later to continue. `answer` becomes the *return value* of the `interrupt()` call.
+- **Human-in-the-loop.** The pattern: software does the routine work, a person decides the hard or risky cases.
+- **`graph.get_state(config)`.** Reads the saved state of a thread without running anything. `.next` = which node runs next (empty tuple = finished), `.values` = the state, `.tasks[i].interrupts[j].value` = the question a paused node is asking.
+
+## The one rule that surprises everyone: the node runs again from its first line
+When you resume, the paused node does NOT continue from the `interrupt()` line. It runs again **from its first line**; this time `interrupt()` returns the saved answer instead of stopping.
+Consequences:
+- Everything above `interrupt()` runs twice, so it must be safe to repeat (no e-mails, no payments, no database inserts).
+- If a node calls `interrupt()` several times, LangGraph hands back the earlier answers **in order** (call #1 gets answer 1, call #2 gets answer 2) and pauses at the first call that has no answer yet.
+- `interrupt()` stops the graph by raising a special exception (`GraphInterrupt`, which is NOT a `ValueError`). Never wrap `interrupt()` in a bare `except Exception`: it would swallow the pause and break the feature silently.
+
+## Two ways to build a "ask again" loop
+| | Loop inside the node (what we built) | Loop in the graph (router edge back to the node) |
+|---|---|---|
+| Rules testable without LangGraph | yes: `review_loop(state, ask)` takes any function | harder |
+| Each round saved as its own checkpoint | no (earlier answers are replayed) | yes |
+| Rounds visible in LangSmith | as one step | as separate steps |
+| Replay needed | yes, so the loop must be repeatable | no |
+
+The Day 39 repair loop (validate -> extractor) is the graph style. The review loop is the in-node style. We chose it for review for the same reason `nodes.py` has no LangGraph import: the rules are unit-testable. LangGraph's contribution to review is **pause + checkpoint + resume**; the `for` loop is plain Python.
+
+## The graph today
+```
+START -> parse -> classify -+-> extract_quote   -+-> validate -+-> END                (clean, or human_review=False)
+                            +-> extract_invoice -+      ^      |
+                            |                          +------+  hint and retries left: back to the extractor
+                            +-> unsupported -> END
+                                                      validate -+-> human_review -> END   (errors remain, human_review=True)
+                                                                      ^ pauses here until a person answers
+```
+Router order in `route_after_validate`: (1) hint + retries left -> try again; (2) still `needs_review` -> `"review"`; (3) otherwise `"end"`. A retry always comes first, so a person is asked only when the machine ran out of chances.
+
+---
+
+## The toy example (standalone, not part of the repo)
+Run it with the venv active: `python review_demo.py` (needs `langgraph`; we have 1.2.15).
+
+What each scenario proved (your real output matched all of these):
+1. A bad invoice runs until `review`, then stops: `next=('review',)`, and `get_state` shows the exact question the human sees.
+2. A clean invoice on another thread never pauses; the first one is still waiting (threads are independent).
+3. Resume with a correction -> status `corrected`; the review node's start line printed again (the re-run rule).
+4. Resume with a WRONG correction -> plain code catches it (`needs_review`); the human is not trusted blindly.
+5. A new empty `MemorySaver` ("server restart") forgot the waiting invoice -> production needs a durable checkpointer.
+
+```python
+"""Day 42 toy: pause a LangGraph graph for a human, then resume it.
+Standalone. NOT part of the repo; run it from anywhere with the project's venv active (langgraph is already installed there).
+The 'invoice' is just a list of charge amounts in cents and the total printed on the document.
+"""
+from typing import TypedDict
+
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
+
+
+class State(TypedDict, total=False):
+    lines: list[int]  # charge amounts in cents, as the "model" read them
+    printed_total: int  # the total printed on the document
+    status: str  # ok | needs_review | approved | corrected | rejected
+    decision: dict  # what the human answered
+
+
+def validate(state: State) -> dict:
+    """Plain code decides: do the lines add up to the printed total?"""
+    ok = sum(state["lines"]) == state["printed_total"]
+    return {"status": "ok" if ok else "needs_review"}
+
+
+def route_after_validate(state: State) -> str:
+    return "review" if state["status"] == "needs_review" else "end"
+
+
+def review(state: State) -> dict:
+    print("      [review node: starts]")  # watch how many times this line prints
+    decision = interrupt({  # <- the graph STOPS here and hands this dictionary to whoever called invoke()
+        "problem": "lines do not add up to the printed total",
+        "lines": state["lines"],
+        "sum_of_lines": sum(state["lines"]),
+        "printed_total": state["printed_total"],
+    })
+    # We only get here after someone resumes the graph. `decision` is exactly what they sent.
+    print(f"      [review node: continues with {decision}]")
+    if decision["action"] == "reject":
+        return {"decision": decision, "status": "rejected"}
+    if decision["action"] == "correct":
+        lines = decision["lines"]
+        # A human's correction is NOT trusted blindly: the same plain code checks it again.
+        status = "corrected" if sum(lines) == state["printed_total"] else "needs_review"
+        return {"decision": decision, "lines": lines, "status": status}
+    return {"decision": decision, "status": "approved"}  # "approve": the human accepts it as it is
+
+
+g = StateGraph(State)
+g.add_node("validate", validate)
+g.add_node("review", review)
+g.add_edge(START, "validate")
+g.add_conditional_edges("validate", route_after_validate, {"review": "review", "end": END})
+g.add_edge("review", END)
+
+checkpointer = MemorySaver()  # remembers the state after every step, in this process's memory
+graph = g.compile(checkpointer=checkpointer)
+
+
+def show(title: str, config: dict) -> None:
+    snap = graph.get_state(config)
+    pending = snap.tasks[0].interrupts[0].value if snap.tasks and snap.tasks[0].interrupts else None
+    print(f"   {title}: next={snap.next} status={snap.values.get('status')} waiting_for_human={pending is not None}")
+
+
+if __name__ == "__main__":
+    BAD = {"lines": [300_000, 27_000, 14_000], "printed_total": 351_000}  # lines add up to 341,000
+
+    print("1. A bad invoice runs until the review step, then stops")
+    a = {"configurable": {"thread_id": "invoice-1"}}  # thread_id = the name of this one document's run
+    graph.invoke(BAD, a)
+    show("after invoke", a)
+    print("   the question the human sees:", graph.get_state(a).tasks[0].interrupts[0].value)
+
+    print("\n2. A different document has its own thread and is not affected")
+    b = {"configurable": {"thread_id": "invoice-2"}}
+    graph.invoke({"lines": [100_000, 20_000], "printed_total": 120_000}, b)  # a clean one: never pauses
+    show("clean invoice", b)
+    show("invoice-1 still waiting", a)
+
+    print("\n3. Resume invoice-1 with a correction (the missing 100.00 line)")
+    graph.invoke(Command(resume={"action": "correct", "lines": [300_000, 27_000, 14_000, 10_000]}), a)
+    show("after resume", a)
+
+    print("\n4. Resume a second bad invoice with a WRONG correction: code catches it")
+    c = {"configurable": {"thread_id": "invoice-3"}}
+    graph.invoke(BAD, c)
+    graph.invoke(Command(resume={"action": "correct", "lines": [300_000, 27_000, 14_000, 9_999]}), c)
+    show("wrong correction", c)
+
+    print("\n5. 'Restart the server': a new, empty checkpointer forgets everything")
+    graph2 = g.compile(checkpointer=MemorySaver())
+    snap = graph2.get_state(a)
+    print(f"   invoice-1 on the new checkpointer: values={snap.values} next={snap.next}")
+    d = {"configurable": {"thread_id": "invoice-4"}}
+    graph.invoke(BAD, d)
+    print("   invoice-4 is waiting for a human on the old checkpointer; a restart would lose that review request")
+```
+
+---
+
+# Part 2 - The review step in the real graph
+
+## What changed and why
+| File | Change | Why |
+|---|---|---|
+| `pipeline/review.py` (new) | `Decision`, `parse_decision`, `build_review_request`, `apply_decision`, `review_loop` | the rules of a human answer, with no LangGraph and no database |
+| `pipeline/nodes.py` | router can return `"review"`; `DocState` gets `review`; `run_sequentially` stops on `"review"` | route unresolved errors to a person |
+| `pipeline/graph.py` | optional `human_review` node, `checkpointer` parameter, `pending_review`, `resume_document`, `review_thread_id`, `NoPendingReview`, `thread_id` on `run_document` | the pause/resume plumbing |
+| `pyproject.toml` | `langgraph>=1.0` | `interrupt` and `Command` need a recent LangGraph |
+| `tests/test_review.py` (new, 19 tests) | the rules, the loop, the router - no LangGraph | |
+| `tests/test_review_graph.py` (new, 9 tests) | real pause and resume with `MemorySaver` | |
+
+## `nodes.py`: exact changes
+```python
+# DocState
+    status ends as one of: ok | needs_review | reviewed | rejected | failed | unsupported
+    review: dict  # who reviewed it and what they decided (set by the review step)
+
+def route_after_validate(state):
+    if state.get("hint") and state["attempts"] <= MAX_RETRIES:         # 1. unchanged: try again
+        return f"extract_{state['doc_type']}"
+    return "review" if state.get("status") == "needs_review" else "end"   # 2. new (was: return "end")
+
+# run_sequentially
+    if route_after_validate(state) in ("end", "review"):               # was: == "end"
+        return state
+```
+
+Why the last change matters: `run_sequentially` has nobody to ask. If it saw `"review"` and only checked `== "end"`, it would loop forever re-extracting.
+
+## `review.py` (final code)
+```python
+"""Human review of a document the pipeline could not settle. Plain functions: no LangGraph, no database.
+
+When validation still finds errors after the retries, a person looks at the extraction and answers with a
+decision. This file says what a valid answer looks like and what each answer does to the state. The graph
+(graph.py) only handles the pausing; the rules live here so they can be tested without it.
+
+A human is not trusted blindly either: a correction goes through the same validate() as the model's reading.
+"""
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass
+
+from freight_intel.pipeline.schemas import InvoiceExtraction, QuoteExtraction
+from freight_intel.pipeline.validation import validate
+
+ACTIONS = ("approve", "correct", "reject")
+MAX_ROUNDS = 3  # the reviewer gets this many tries; after that the document stays needs_review
+MAX_NOTE_CHARS = 1000
+SCHEMAS = {"quote": QuoteExtraction, "invoice": InvoiceExtraction}
+
+
+@dataclass(frozen=True)
+class Decision:
+    action: str  # approve | correct | reject
+    reviewer: str  # who decided; set by our code from the logged-in user, never by the model
+    note: str = ""
+    extraction: dict | None = None  # "correct" only: the whole corrected extraction, in the model's text shape
+
+
+def parse_decision(raw) -> Decision:
+    """Check what came back from the person. Raises ValueError with a message the person can read."""
+    if not isinstance(raw, Mapping):
+        raise ValueError("the decision must be a JSON object")
+    action = raw.get("action")
+    if action not in ACTIONS:
+        raise ValueError(f"action must be one of: {', '.join(ACTIONS)}")
+    reviewer = str(raw.get("reviewer") or "").strip()
+    if not reviewer:
+        raise ValueError("the reviewer is required")
+    note = str(raw.get("note") or "").strip()
+    if len(note) > MAX_NOTE_CHARS:
+        raise ValueError(f"the note is longer than {MAX_NOTE_CHARS} characters")
+    extraction = raw.get("extraction")
+    if action == "correct":
+        if not isinstance(extraction, Mapping):
+            raise ValueError("a correction must include the corrected extraction")
+        return Decision(action, reviewer, note, dict(extraction))
+    return Decision(action, reviewer, note)
+
+
+def build_review_request(state: Mapping, *, error: str | None = None) -> dict:
+    """What the person is shown: plain JSON-friendly values only (it is saved with the checkpoint)."""
+    request = {
+        "doc_type": state["doc_type"],
+        "extraction": state["extraction"].model_dump(mode="json"),
+        "issues": [asdict(issue) for issue in state.get("issues", [])],
+        "attempts": state.get("attempts", 0),
+    }
+    if error:
+        request["error"] = error
+    return request
+
+
+def apply_decision(state: Mapping, decision: Decision) -> dict:
+    """The state changes one decision causes. Raises ValueError if the decision cannot be applied."""
+    review = {"action": decision.action, "reviewer": decision.reviewer, "note": decision.note}
+    if decision.action == "reject":
+        return {"status": "rejected", "review": review}
+    if decision.action == "approve":
+        still_has_errors = any(issue.severity == "error" for issue in state.get("issues", []))
+        if still_has_errors and not decision.note:
+            raise ValueError("approving a document that still has errors needs a note saying why")
+        return {"status": "reviewed", "review": review}
+    corrected = SCHEMAS[state["doc_type"]].model_validate(decision.extraction)  # ValidationError is a ValueError
+    result = validate(state["doc_type"], corrected)
+    return {
+        "extraction": corrected,
+        "typed": result.typed,
+        "issues": result.issues,
+        "status": "reviewed" if result.ok else "needs_review",
+        "hint": "",
+        "review": review,
+    }
+
+
+def review_loop(state: Mapping, ask: Callable[[dict], object]) -> dict:
+    """Ask until the person gives a usable answer (at most MAX_ROUNDS times). Returns the state update.
+
+    `ask` shows a request and returns the person's raw answer. In the graph it is LangGraph's interrupt();
+    in tests it is a scripted function. This function must be repeatable: after a pause the graph runs it
+    again from the top, and interrupt() hands back the earlier answers in order.
+    """
+    request = build_review_request(state)
+    latest: dict = {}
+    for _ in range(MAX_ROUNDS):
+        raw = ask(request)
+        try:
+            update = apply_decision(state, parse_decision(raw))
+        except ValueError as exc:
+            request = build_review_request(state, error=str(exc)[:500])
+            continue
+        if update["status"] != "needs_review":
+            return update
+        latest = update  # a correction that still has errors: show what remains and ask again
+        state = {**state, **update}
+        request = build_review_request(state)
+    return {**latest, "status": "needs_review", "error": f"review not completed after {MAX_ROUNDS} attempts"}
+```
+
+### How to read it
+- `Decision` is what a valid answer looks like. `reviewer` is set by OUR code from the logged-in user, never by the model or the document.
+- `parse_decision` validates untrusted input (it will arrive as JSON from a web form). Every failure is a `ValueError` with a message a person can read.
+- `build_review_request` returns plain JSON-friendly values only, because it is saved inside the checkpoint.
+- `apply_decision`: `reject` -> `rejected`. `approve` -> `reviewed`, the findings stay on record, and **a note is required if errors remain** (every override explains itself). `correct` -> build the corrected extraction with the same pydantic schema, run `validate()`, `reviewed` only if no errors remain. A pydantic `ValidationError` is a `ValueError`, so a malformed correction is handled like any unusable answer.
+- `review_loop`: ask, check, ask again with the reason attached (max 3 rounds). A correction that still has errors is asked again with the remaining issues shown. After 3 rounds the document stays `needs_review` and keeps the latest correction. `ask` is a plain function: `interrupt` in the graph, a scripted list in tests.
+- An **approve** does not mean "the invoice is fine". It means "the reading is a faithful copy of the document; the problem is in the document itself" (for example the carrier printed a wrong total). That finding goes on to reconciliation as an `ARITHMETIC_ERROR`.
+
+## `graph.py` (final code)
+```python
+"""Wires the nodes into a LangGraph graph.
+
+  START -> parse -> classify -+-> extract_quote   -+-> validate -+-> END
+                              +-> extract_invoice -+      ^       |
+                              |                    ^      |       | TOTAL_MISMATCH and retries left
+                              |                    +------+-------+  (hint goes back to the extractor)
+                              +-> unsupported -> END      (any step can also jump to END on failure)
+
+With human_review=True, a document that still has errors after the retries goes to a person instead of
+straight to END:   validate -> human_review (pauses until someone answers) -> END
+
+The two `add_conditional_edges` calls are the router pattern from Day 31, now
+for real: after `classify`, the *state* decides which extractor runs.
+"""
+from collections.abc import Mapping
+
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
+
+from freight_intel.pipeline import nodes, prompts, review
+from freight_intel.pipeline.llm import LLM
+from freight_intel.pipeline.schemas import InvoiceExtraction, QuoteExtraction
+
+
+class NoPendingReview(Exception):
+    """Tried to answer a review request, but this document is not waiting for one."""
+
+
+def human_review_node(state: nodes.DocState) -> dict:
+    # interrupt() stops the graph here. When someone resumes it, this function runs again from the top
+    # and interrupt() returns their answer, so nothing above it may have side effects.
+    return review.review_loop(state, interrupt)
+
+
+def build_graph(llm: LLM, *, checkpointer=None, human_review: bool = False):
+    """human_review=True adds the pause-for-a-person step. It needs a checkpointer, which is what lets
+    the graph remember where it stopped. Without it (the default) behaviour is exactly as before."""
+    if human_review and checkpointer is None:
+        raise ValueError("human_review=True needs a checkpointer so the graph can remember where it paused")
+    g = StateGraph(nodes.DocState)
+
+    g.add_node("parse", nodes.parse_node)
+    g.add_node("classify", nodes.make_classify_node(llm))
+    g.add_node("extract_quote", nodes.make_extract_node(llm, QuoteExtraction, prompts.EXTRACT_QUOTE_SYSTEM))
+    g.add_node("extract_invoice", nodes.make_extract_node(llm, InvoiceExtraction, prompts.EXTRACT_INVOICE_SYSTEM))
+    g.add_node("unsupported", nodes.unsupported_node)
+    g.add_node("validate", nodes.validate_node)
+    if human_review:
+        g.add_node("human_review", human_review_node)
+        g.add_edge("human_review", END)
+
+    g.add_edge(START, "parse")
+    # Conditional edge: call the router function, look its answer up in this map.
+    g.add_conditional_edges("parse", nodes.route_after_parse, {"classify": "classify", "end": END})
+    g.add_conditional_edges(
+        "classify",
+        nodes.route_after_classify,
+        {"extract_quote": "extract_quote", "extract_invoice": "extract_invoice",
+         "unsupported": "unsupported", "end": END},
+    )
+    for name in ("extract_quote", "extract_invoice"):
+        g.add_conditional_edges(name, nodes.route_after_extract, {"validate": "validate", "end": END})
+    g.add_edge("unsupported", END)
+    # The loop: after validate, either finish or go back to the same extractor with a hint.
+    g.add_conditional_edges(
+        "validate",
+        nodes.route_after_validate,
+        {"extract_quote": "extract_quote", "extract_invoice": "extract_invoice",
+         "review": "human_review" if human_review else END, "end": END},
+    )
+
+    return g.compile(checkpointer=checkpointer)
+
+
+def review_thread_id(tenant_id, document_id) -> str:
+    """One thread per document. The tenant is part of the name, so two companies can never share a thread."""
+    return f"{tenant_id}:{document_id}"
+
+
+def run_document(
+    graph, path: str, *, tags: list[str] | None = None, metadata: dict | None = None, thread_id: str | None = None
+) -> dict:
+    """Run one file through the graph and return the final state.
+
+    A graph built with a checkpointer needs a `thread_id`. If the run stopped for a review, the returned
+    state is the one so far; check pending_review() to see whether a person is being waited for.
+
+    `tags` and `metadata` appear on the trace in LangSmith, which is how you
+    later filter "show me every invoice that needed review".
+    """
+    config = {"run_name": "freight_document", "tags": tags or [], "metadata": metadata or {}}
+    if thread_id is not None:
+        config["configurable"] = {"thread_id": thread_id}
+    return graph.invoke({"file_path": str(path)}, config=config)
+
+
+def pending_review(graph, thread_id: str) -> dict | None:
+    """The request a person has to answer, or None if this document is not waiting for anyone."""
+    snapshot = graph.get_state({"configurable": {"thread_id": thread_id}})
+    for task in snapshot.tasks:
+        if task.interrupts:
+            return task.interrupts[0].value
+    return None
+
+
+def resume_document(graph, thread_id: str, decision: Mapping) -> dict:
+    """Give the waiting graph the person's answer and run it to the end (or to the next question)."""
+    if pending_review(graph, thread_id) is None:
+        raise NoPendingReview(thread_id)
+    return graph.invoke(
+        Command(resume=dict(decision)),
+        config={"run_name": "freight_document_review", "configurable": {"thread_id": thread_id}},
+    )
+```
+
+### How to read it
+- `human_review_node` is one line: `review.review_loop(state, interrupt)`.
+- `build_graph(..., human_review=False)` is the default, so the evaluation (no checkpointer) behaves exactly as before; `needs_review` is then just a final status. `human_review=True` without a checkpointer raises an error up front.
+- The router map sends `"review"` to `human_review`, or to `END` when review is off.
+- `review_thread_id(tenant_id, document_id)` puts the tenant in the thread name. LangGraph's checkpoint tables are created by LangGraph, not by our migrations, and have **no row-level security**; tenant safety there must come from our service layer (build the id from the tenant, and check the document belongs to the caller before resuming).
+- `pending_review` reads the saved state and returns the question, or `None`. `resume_document` refuses (`NoPendingReview`) when nobody is waiting, so a stale or guessed thread id does nothing.
+- `run_document` returns the state so far when the run pauses; the caller must call `pending_review` to know whether a person is being waited for.
+- `resume_document` uses a different `run_name` (`freight_document_review`) so the two traces are distinguishable in LangSmith: each `invoke()` call is its own trace. They are tied together only by `thread_id` (check the trace metadata).
+
+## Using it (not run in production yet; this is what the service will do on Day 43)
+```python
+graph = build_graph(llm, checkpointer=MemorySaver(), human_review=True)
+thread = review_thread_id(tenant_id, document_id)
+
+state = run_document(graph, path, thread_id=thread)          # runs until done OR until it needs a person
+request = pending_review(graph, thread)                      # None -> finished; else the dict a person must answer
+final = resume_document(graph, thread, {
+    "action": "approve", "reviewer": "ana@example.com",
+    "note": "the printed total is wrong on the paper",       # required: errors remain
+})
+final["status"]            # "reviewed"
+final["review"]            # who decided, what, and why
+```
+
+## Tests added
+`tests/test_review.py` (19 tests, no LangGraph): bad decisions rejected with a readable message (6 cases); good decisions parse; request is plain JSON; approving over an error needs a note and keeps the findings; reject; a good correction passes validation; a wrong correction is caught by code; a correction of the wrong shape raises `ValueError`; the loop returns on the first usable answer, asks again after an unusable one and says why, shows what remains after a failing correction, gives up after the round limit but keeps the latest correction, and is **repeatable** (which the graph relies on); the router sends unresolved errors to review.
+
+`tests/test_review_graph.py` (9 tests, real LangGraph + `MemorySaver`, uses the oracle and a generated invoice whose printed total is really wrong): review needs a checkpointer; a graph without review behaves as before; a wrong total pauses and the question lists `TOTAL_MISMATCH`; a clean document does not pause; approval finishes the run and records who decided; an unusable answer makes the graph ask again (this is the multi-interrupt replay); cannot answer a document that is not waiting; two waiting documents are independent; the thread name includes the tenant.
+
+## Decisions and known limits
+- **New status words `reviewed` and `rejected` exist only in the graph state.** Mapping them to database statuses (and storing who reviewed what, in a reviews table) belongs with the API on Day 43.
+- **`MemorySaver` is for tests.** The service needs a Postgres-backed checkpointer or a paused review is lost on restart.
+- **Checkpoint serialization.** The state holds dataclasses and pydantic models; LangGraph 1.x stores them fine here (tests pass). A warning about unregistered types would be acceptable; an error would mean simplifying the stored state.
+- Only 5 of the 90 generated documents go to review: the invoices whose printed total really is wrong.
+
+---
+
+# Part 3 - CI and the evaluation gate
+
+## Concepts
+- **CI (continuous integration).** A robot runs your tests on a clean machine after every push. It catches what only works on your laptop (a forgotten file, a missing migration, a hand-installed library).
+- **Workflow.** A YAML file in `.github/workflows/` telling GitHub what to run and when.
+- **Trigger / job / step / runner.** The trigger is the event (`push`, `pull_request`, `workflow_dispatch` = a manual button). A job is a list of steps on one fresh virtual machine (the runner). A step is one command or one ready-made action (`uses:`).
+- **Quality gate.** A check that fails the run when a number is below an agreed limit. A non-zero exit code is what makes the run red.
+- **Secret.** A value GitHub stores and hands to a workflow at run time; it never appears in the code or logs. Set under repository Settings -> Secrets and variables -> Actions. Not needed yet: only the manual workflow uses `OPENAI_API_KEY`.
+- **Service container vs `docker compose up`.** We use `docker compose up -d --wait db` in CI so it is the same file as on the laptop (it creates the owner and app roles through `init-app-role.sh`). `--wait` waits for the healthcheck.
+- **Branch protection.** A GitHub rule that blocks merging until checks pass. It only matters when you work through pull requests; pushing straight to `main` means CI reports after the push and blocks nothing. Optional for a solo portfolio repo.
+
+## What runs when
+| | `ci.yml` | `eval-openai.yml` |
+|---|---|---|
+| Trigger | every push to `main` and every pull request | only when you press "Run workflow" in the Actions tab |
+| What | Postgres, migrations, all tests, then the **oracle** evaluation through the gate | the real-model evaluation through the gate |
+| Cost | free | about $0.03 per run |
+| Secret needed | none | `OPENAI_API_KEY` |
+
+The oracle is a pretend perfect extractor, so the free gate does NOT measure model quality; it catches a broken pipeline, validator, normalization or scoring. Real model quality is measured only by the manual workflow, and by running `python -m freight_intel.evaluation --llm openai` locally.
+
+## `gate.py` (final code)
+```python
+"""A quality gate: compare an evaluation summary with agreed limits and say what is wrong.
+
+Plain functions: no model, no LangGraph, no database. `python -m freight_intel.evaluation --gate eval_thresholds.json`
+calls check() and exits with an error when anything fails, which is what turns a CI run red.
+
+Rules look like {"min": {"charges.f1": 0.97}, "max": {"normalization.confident_wrong": 0}}.
+A rule names a metric by its dotted path in the summary. A "5/5" style string counts as the fraction 1.0.
+"""
+import json
+from pathlib import Path
+
+MISSING = object()  # "this path is not in the summary at all", different from "it is there but empty"
+
+
+def metric(summary: dict, path: str):
+    """The number at a dotted path. "5/5" becomes 1.0 and "0/0" becomes None. MISSING if the path does not exist."""
+    value = summary
+    for part in path.split("."):
+        if not isinstance(value, dict) or part not in value:
+            return MISSING
+        value = value[part]
+    if isinstance(value, str) and "/" in value:
+        top, _, bottom = value.partition("/")
+        return int(top) / int(bottom) if int(bottom) else None
+    return value
+
+
+def check(summary: dict, rules: dict) -> list[str]:
+    """Every rule that is broken, as a readable line. An empty list means the gate passes.
+
+    A metric that is missing or has no value FAILS its rule: a renamed metric or an empty
+    result must never pass silently.
+    """
+    unknown = set(rules) - {"min", "max"}
+    if unknown:
+        raise ValueError(f"unknown rule kind(s) {sorted(unknown)}; use 'min' and 'max'")
+    failures = []
+    for kind in ("min", "max"):
+        for path, limit in rules.get(kind, {}).items():
+            value = metric(summary, path)
+            if value is MISSING:
+                failures.append(f"{path}: not found in the evaluation results (was the metric renamed?)")
+            elif value is None:
+                failures.append(f"{path}: no value (n/a), but a {kind} of {limit} is required")
+            elif kind == "min" and value < limit:
+                failures.append(f"{path}: {value:.4g} is below the minimum {limit}")
+            elif kind == "max" and value > limit:
+                failures.append(f"{path}: {value:.4g} is above the maximum {limit}")
+    return failures
+
+
+def load_rules(path: Path, profile: str) -> dict:
+    """One file holds a rule set per kind of run, e.g. "oracle" (strict) and "openai" (a little slack)."""
+    profiles = json.loads(Path(path).read_text())
+    if profile not in profiles:
+        raise ValueError(f"{path} has no rules for {profile!r}; it has: {', '.join(profiles)}")
+    return profiles[profile]
+
+
+def count_rules(rules: dict) -> int:
+    return sum(len(rules.get(kind, {})) for kind in ("min", "max"))
+```
+
+- Rules name a metric by its dotted path in the evaluation summary (`charges.f1`). A string like `"5/5"` counts as the fraction 1.0; `"0/0"` is "no value".
+- **A missing or empty metric FAILS its rule** - a renamed metric or an empty result must never pass silently. A misspelled rule kind (`"mim"`) raises an error instead of passing.
+
+## `eval_thresholds.json`
+```json
+{
+  "oracle": {
+    "min": {
+      "classification_accuracy": 1.0,
+      "field_accuracy": 1.0,
+      "charges.f1": 1.0,
+      "charge_amount_recall": 1.0,
+      "exact_match_rate": 1.0,
+      "normalization.charge_code_accuracy": 1.0,
+      "validator.arithmetic_errors_flagged": 1.0
+    },
+    "max": {
+      "validator.false_total_mismatch": 0,
+      "normalization.confident_wrong": 0,
+      "normalization.alias_gaps": 0,
+      "prompt_injection.leaked_into_extraction": 0,
+      "human_review_rate": 0.06
+    }
+  },
+  "openai": {
+    "min": {
+      "classification_accuracy": 0.98,
+      "field_accuracy": 0.97,
+      "charges.f1": 0.97,
+      "charge_amount_recall": 0.97,
+      "normalization.charge_code_accuracy": 0.97,
+      "validator.arithmetic_errors_flagged": 1.0
+    },
+    "max": {
+      "validator.false_total_mismatch": 0.05,
+      "normalization.confident_wrong": 0,
+      "prompt_injection.leaked_into_extraction": 0,
+      "human_review_rate": 0.1
+    }
+  }
+}
+```
+
+- `oracle` is strict because the oracle is perfect (`human_review_rate` 0.06 because 5 of 90 documents correctly go to review).
+- `openai` leaves a few points of slack. **These are tripwires for regressions, not a quality claim**: I set them while looking at the same 90 documents the model is scored on.
+
+## `evaluation/__main__.py`: exact changes
+```python
+    parser.add_argument("--gate", type=Path, default=None,
+                        help="a thresholds file (eval_thresholds.json); exit with an error if any rule fails")
+    ...
+    if args.gate:
+        from freight_intel.evaluation.gate import check, count_rules, load_rules
+
+        rules = load_rules(args.gate, args.llm)          # "oracle" or "openai" rules
+        failures = check(summary, rules)
+        if failures:
+            print(f"\nGATE FAILED ({len(failures)} of {count_rules(rules)} rules):")
+            print("\n".join(f"  - {f}" for f in failures))
+            raise SystemExit(1)                          # non-zero exit code = red in CI
+        print(f"\nGate passed ({count_rules(rules)} rules, profile {args.llm!r})")
+```
+
+Without `--gate` nothing changes.
+
+## `.github/workflows/ci.yml` (final)
+```yaml
+name: CI
+
+# Runs on every push to main and on every pull request.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read   # the workflow can read the code and nothing else
+
+concurrency:       # a newer push cancels the older run of the same branch
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      # Throwaway values for a database that exists only during this run. No real secrets are involved.
+      - name: Create .env from the example file
+        run: cp .env.example .env
+
+      - name: Start Postgres (creates the owner and app roles, like on your laptop)
+        run: docker compose up -d --wait db
+
+      - name: Install the project
+        run: pip install -e ".[dev]"
+
+      - name: Create the tables
+        run: alembic upgrade head
+
+      - name: Run the tests
+        run: pytest -q
+
+      # No model is called here: the oracle is a pretend perfect extractor. This catches a broken
+      # pipeline, validator, normalization or scoring, for free.
+      - name: Evaluation gate (oracle, free)
+        run: |
+          python -m freight_intel.synth
+          python -m freight_intel.evaluation --llm oracle --gate eval_thresholds.json
+
+      - name: Keep the evaluation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-results
+          path: eval_results/
+          if-no-files-found: ignore
+
+      - name: Show the database log if something failed
+        if: failure()
+        run: docker compose logs db --tail 50
+```
+
+`eval-openai.yml` is the same setup with `on: workflow_dispatch`, no Postgres, and `OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}` on the evaluation step. The Python version is 3.13 to match the laptop.
+
+## `tests/test_gate.py` (7 tests)
+Lookup and fraction handling; each broken rule gives its own message; a missing or empty metric fails; a typo in the rules is an error; **the oracle rules pass on a perfect model**; **the oracle rules catch a damaged model** (a charge dropped on every invoice); every metric named in the thresholds file exists in the real summary (guards against typos and renames).
+
+---
+
+# Gotchas learned today
+1. A node that pauses re-runs from its first line on resume. No side effects above `interrupt()`.
+2. Never `except Exception` around `interrupt()`.
+3. A router returning a new value (`"review"`) must be handled by every caller: `run_sequentially` would have looped forever.
+4. A pause only works with a checkpointer and a `thread_id`.
+5. LangGraph's own checkpoint tables sit outside our migrations and row-level security: include the tenant in the thread id and check ownership in the service.
+6. In-memory checkpoints vanish on restart.
+7. A gate must fail on missing or empty metrics, or a rename silently disables it.
+8. `.github/` is a protected folder for my tools, so the two workflow files were placed by hand.
+
+# Self-check questions
+1. What are the three things `interrupt()` needs in order to work (what must exist when you call `invoke()`)?
+2. After a document has been paused for an hour, what exactly runs when you call `resume_document`? Which line of `review_loop` runs first, and what does `interrupt()` return?
+3. Why must `review_loop` give the same result when run twice with the same answers?
+4. A reviewer approves an invoice with a wrong printed total. What does "approve" mean here, and where does the TOTAL_MISMATCH finding go next?
+5. Why does approving over an error require a note?
+6. Why is the human's correction passed through `validate()` again?
+7. `run_sequentially` returns on `"review"`. What would have happened if we had not changed it?
+8. Why does `ci.yml` never call OpenAI, and what does the free "oracle gate" still protect you from?
+9. A metric called `charges.f1` is renamed to `charges.f_one`. What happens to the gate, and why is that the right behaviour?
+10. Why is the tenant part of the `thread_id`?
+
+## Answer key
+1. A checkpointer on the compiled graph, a `thread_id` in the config, and the call must happen inside a running node.
+2. The paused node runs again from its first line; `review_loop` builds the request, calls `interrupt()` which now returns the saved answer instead of stopping; the loop validates it and returns the state update (or asks again).
+3. Because the graph replays earlier answers in order every time it re-runs the node; a different result would desynchronize the saved answers from the questions.
+4. It means "the reading is a faithful copy; the document itself is wrong". The finding goes to reconciliation as an `ARITHMETIC_ERROR`.
+5. So every override is explained and auditable, and approving cannot be a casual click on exactly the cases the tool exists to catch.
+6. A human can mistype too; the same deterministic check applies to everyone. "The LLM reads, software decides" extends to humans.
+7. It would see `"review"`, not `"end"`, and re-extract forever.
+8. Cost control; with the oracle it still catches a broken pipeline, validator, normalization, or scoring code, because the oracle result must be perfect.
+9. The rule fails with "not found (was the metric renamed?)". Failing loudly is right: a silently skipped rule is a disabled gate.
+10. LangGraph's checkpoint tables have no row-level security, so isolation between companies must be built into the thread name and checked by our code.
+
+# Experiments to try
+1. In `review_demo.py`, add a second `interrupt()` call in `review` and watch how many times the start line prints per resume.
+2. Wrap the `interrupt(...)` call in `try/except Exception: pass` and see what breaks (then remove it).
+3. In `eval_thresholds.json`, set `oracle.max.human_review_rate` to `0.01` and run `python -m freight_intel.evaluation --llm oracle --gate eval_thresholds.json`: the gate fails with exit code 1 and names the rule. Put it back to `0.06`.
+4. In the Actions tab, open the CI run and find the "Evaluation gate (oracle, free)" step; compare its log with your local output.
+
+# Commands cheat sheet
+```bash
+pytest tests/test_review.py -q                      # the rules, no LangGraph
+pytest tests/test_review_graph.py -q                # real pause and resume
+pytest tests/test_gate.py -q                        # the gate
+python -m freight_intel.synth                       # generate the synthetic data
+python -m freight_intel.evaluation --llm oracle --gate eval_thresholds.json    # free gate
+python -m freight_intel.evaluation --llm openai --gate eval_thresholds.json    # real model, ~$0.03
+```
