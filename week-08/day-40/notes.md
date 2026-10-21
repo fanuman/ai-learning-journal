@@ -1393,3 +1393,1151 @@ python -m freight_intel.synth                       # generate the synthetic dat
 python -m freight_intel.evaluation --llm oracle --gate eval_thresholds.json    # free gate
 python -m freight_intel.evaluation --llm openai --gate eval_thresholds.json    # real model, ~$0.03
 ```
+
+# Day 43 - The documents API: upload, background processing, human review, reconcile
+
+Status: code done, **299 tests passed** on the Mac. Part 1 = concepts. Part 2 = database and checkpoint changes. Part 3 = the services. Part 4 = the HTTP layer. Part 5 = tests, decisions, limits, questions.
+
+## The problem this solves
+Until today everything worked only inside Python tests: you could call the pipeline, but nobody could *use* it. A real product needs a front door:
+1. a person **uploads** a file and gets an answer at once (reading takes seconds to minutes),
+2. a **background job** reads it,
+3. if the machine is unsure, the document **waits** (even across a restart) until a person decides,
+4. the person's decision resumes the work, and an invoice can then be **reconciled** against its quote.
+
+Principle kept: *the LLM reads, software decides.* The API never trusts the client either: the reviewer is the logged-in user, the filename is never a path, the file type is checked by content, and a correction goes through the same `validate()` as the model's reading.
+
+---
+
+# Part 1 - Concepts
+
+## Glossary
+- **202 Accepted.** HTTP status meaning "I got your request and started it, the result is not ready". The body carries the id; the client **polls** `GET /documents/{id}` until the status changes.
+- **Location header.** Tells the client where to look at the new thing (`/documents/<id>`).
+- **BackgroundTasks (FastAPI).** Runs a function *after* the response is sent, in the same server process. Simple, no extra infrastructure. Limit: if the server dies mid-run the work is lost and the document stays `processing`. Fix later: a real queue (SQS) and a worker.
+- **Compare-and-set (claim).** `UPDATE documents SET status='processing' WHERE id=... AND status='uploaded'`, then check `rowcount == 1`. The database decides who wins when two workers race; the loser gets 0 rows and does nothing. This gives "exactly once" without locks in Python.
+- **`SELECT ... FOR UPDATE`.** Locks the row until the transaction ends. Used so two reviewers answering the same document are serialised, not interleaved.
+- **Dependency override.** FastAPI lets tests replace a dependency (`get_llm`, `get_saver`, `get_storage`) with a fake. That is why the 25 API tests need no OpenAI key.
+- **Composite foreign key `(tenant_id, id)`.** A child row points at the parent's `(tenant_id, id)` pair, so a row of company A can never reference a row of company B even by mistake.
+- **Append-only table.** Rows are only added, never updated: `reviews` is an audit log. Who decided what, when, with which note.
+- **Checkpoint tables.** LangGraph's own tables (written by `PostgresSaver`) where paused graphs wait. They have **no tenant column and no row-level security**.
+- **Owner role vs app role.** The owner creates tables (DDL). The app role only reads and writes rows (DML). So `setup()` for checkpoint tables runs once as the owner; the running app cannot create tables (a test proves it).
+- **JSON `null` vs SQL `NULL`.** SQLAlchemy stores Python `None` in a JSONB column as the JSON value `null` (a real value!), not as SQL `NULL`. Fix: `JSONB(none_as_null=True)`.
+
+## Why Postgres (and not the existing MySQL)
+Row-level security (the database itself refuses to show company A's rows to company B), JSONB, partial/check constraints and LangGraph's maintained `PostgresSaver` are the reasons. MySQL has no row-level security, so tenant isolation would move entirely into application code.
+
+## Two stores cannot share one transaction
+The paused graph lives in checkpoint tables; documents, extractions, reviews live in our tables. One transaction cannot cover both through two different libraries. So the order is: **move the graph first, then write our tables in ONE transaction** (`apply_pipeline_result` + `reviews.add`). Known gap: if the database write fails after the graph already moved, the graph cannot be resumed with the same answer (see limits).
+
+## Tenant safety for checkpoints
+Checkpoint tables have no row-level security, so safety is built from two things: the `thread_id` is `"<tenant_id>:<document_id>"`, and the service checks the document belongs to the caller's tenant (through the RLS-protected `documents` table) *before* touching the graph.
+
+---
+
+# Part 2 - Database and checkpoint
+
+## Migration `0004_human_review.py` (final)
+What it does: `CHECK` constraints cannot be edited, so it **drops and recreates** `documents_status_check` (adds `rejected`) and `extractions_status_check` (adds `reviewed`); adds `users (tenant_id, id)` unique so `reviews` can use a composite FK; creates the `reviews` table with an action check and `(action='correct') = (corrected_data IS NOT NULL)`; enables RLS with the `tenant_isolation` policy. Downgrade maps `rejected -> failed`, `reviewed -> ok`.
+```python
+"""human review: reviewed/rejected statuses and the reviews audit table
+
+Revision ID: 0004
+Revises: 0003
+
+A person can now settle a document the pipeline could not. That adds two statuses and a table
+that records who decided what.
+
+  documents.status   gains 'rejected'  (a person said: this document is not usable)
+  extractions.status gains 'reviewed'  (a person approved or corrected the reading)
+  reviews            new, append-only: one row per decision, never updated or replaced
+
+`reviews` follows the rules of the other tenant tables: tenant_id on every row, the same
+row-level-security policy, and COMPOSITE foreign keys (tenant_id, id) so a review can never
+point at another tenant's document or user. The reviewer link needs users to offer such a
+key, so this migration adds a unique constraint on users (tenant_id, id). The default
+privileges from docker/postgres/init-app-role.sh already give the app role access to the
+new table.
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
+
+revision: str = "0004"
+down_revision: Union[str, Sequence[str], None] = "0003"
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+OLD_DOCUMENT_STATUSES = "'uploaded', 'processing', 'needs_review', 'processed', 'failed'"
+NEW_DOCUMENT_STATUSES = "'uploaded', 'processing', 'needs_review', 'processed', 'failed', 'rejected'"
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    # A CHECK constraint cannot be edited: drop it and create the longer one.
+    op.drop_constraint("documents_status_check", "documents", type_="check")
+    op.create_check_constraint("documents_status_check", "documents", f"status IN ({NEW_DOCUMENT_STATUSES})")
+    op.drop_constraint("extractions_status_check", "extractions", type_="check")
+    op.create_check_constraint("extractions_status_check", "extractions", "status IN ('ok', 'needs_review', 'reviewed')")
+
+    # Lets reviews point at users by (tenant_id, id) together.
+    op.create_unique_constraint("users_tenant_id_id_key", "users", ["tenant_id", "id"])
+
+    op.create_table(
+        "reviews",
+        sa.Column("id", sa.Uuid(), server_default=sa.text("gen_random_uuid()"), nullable=False),
+        sa.Column("tenant_id", sa.Uuid(), nullable=False),
+        sa.Column("document_id", sa.Uuid(), nullable=False),
+        sa.Column("reviewer_id", sa.Uuid(), nullable=False),
+        sa.Column("action", sa.Text(), nullable=False),
+        sa.Column("note", sa.Text(), server_default="", nullable=False),
+        sa.Column("corrected_data", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
+        sa.CheckConstraint("action IN ('approve', 'correct', 'reject')", name="reviews_action_check"),
+        # Corrected values are stored with a 'correct' decision, and only with that one.
+        sa.CheckConstraint("(action = 'correct') = (corrected_data IS NOT NULL)", name="reviews_corrected_data_check"),
+        sa.ForeignKeyConstraint(["tenant_id"], ["tenants.id"]),
+        sa.ForeignKeyConstraint(
+            ["tenant_id", "document_id"], ["documents.tenant_id", "documents.id"],
+            name="reviews_document_fk", ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["tenant_id", "reviewer_id"], ["users.tenant_id", "users.id"],
+            name="reviews_reviewer_fk",
+        ),
+        sa.PrimaryKeyConstraint("id"),
+    )
+    op.create_index("reviews_document_idx", "reviews", ["document_id", "created_at"], unique=False)
+
+    op.execute("ALTER TABLE reviews ENABLE ROW LEVEL SECURITY")
+    op.execute(
+        "CREATE POLICY tenant_isolation ON reviews "
+        "USING (tenant_id = app_current_tenant()) WITH CHECK (tenant_id = app_current_tenant())"
+    )
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    op.drop_table("reviews")  # also drops its index, policy and constraints
+    op.drop_constraint("users_tenant_id_id_key", "users", type_="unique")
+
+    # The old constraints do not know the new values, so move those rows to the closest old one first.
+    op.execute("UPDATE documents SET status = 'failed' WHERE status = 'rejected'")
+    op.execute("UPDATE extractions SET status = 'ok' WHERE status = 'reviewed'")
+    op.drop_constraint("extractions_status_check", "extractions", type_="check")
+    op.create_check_constraint("extractions_status_check", "extractions", "status IN ('ok', 'needs_review')")
+    op.drop_constraint("documents_status_check", "documents", type_="check")
+    op.create_check_constraint("documents_status_check", "documents", f"status IN ({OLD_DOCUMENT_STATUSES})")
+```
+
+## `models/review.py` and `repositories/reviews.py`
+```python
+"""One row per human decision about a document: who decided what, and why.
+
+Append-only: a decision is never updated or replaced, so the table is the audit trail of
+every approval, correction and rejection. Foreign keys are COMPOSITE (tenant_id, id), like
+the result tables, so a review can never point at another tenant's document or user.
+"""
+import uuid
+
+from sqlalchemy import CheckConstraint, ForeignKey, ForeignKeyConstraint, Index, Text
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column
+
+from freight_intel.models.base import Base
+from freight_intel.models.mixins import CreatedAtMixin, UUIDPrimaryKeyMixin
+
+
+class Review(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+    __tablename__ = "reviews"
+    __table_args__ = (
+        CheckConstraint("action IN ('approve', 'correct', 'reject')", name="reviews_action_check"),
+        # Corrected values are stored with a 'correct' decision, and only with that one.
+        CheckConstraint("(action = 'correct') = (corrected_data IS NOT NULL)", name="reviews_corrected_data_check"),
+        ForeignKeyConstraint(
+            ["tenant_id", "document_id"],
+            ["documents.tenant_id", "documents.id"],
+            name="reviews_document_fk",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["tenant_id", "reviewer_id"],
+            ["users.tenant_id", "users.id"],
+            name="reviews_reviewer_fk",
+        ),
+        Index("reviews_document_idx", "document_id", "created_at"),
+    )
+
+    tenant_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("tenants.id"))
+    document_id: Mapped[uuid.UUID] = mapped_column()
+    reviewer_id: Mapped[uuid.UUID] = mapped_column()  # the logged-in user, set by our code, never by the client
+    action: Mapped[str] = mapped_column(Text)  # approve | correct | reject
+    note: Mapped[str] = mapped_column(Text, server_default="")
+    # The whole corrected extraction ('correct' only). none_as_null makes Python None a real SQL NULL; without
+    # it SQLAlchemy stores the JSON value null, which the reviews_corrected_data_check would count as data.
+    corrected_data: Mapped[dict | None] = mapped_column(JSONB(none_as_null=True))
+```
+```python
+"""All database access for review decisions. Only ORM calls, no business rules."""
+import uuid
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from freight_intel.models import Review
+
+
+def add(
+    session: Session, *, tenant_id: uuid.UUID, document_id: uuid.UUID, reviewer_id: uuid.UUID,
+    action: str, note: str = "", corrected_data: dict | None = None,
+) -> Review:
+    """Record one decision. Reviews are only ever added, never changed."""
+    review = Review(
+        tenant_id=tenant_id, document_id=document_id, reviewer_id=reviewer_id,
+        action=action, note=note, corrected_data=corrected_data,
+    )
+    session.add(review)
+    session.flush()
+    return review
+
+
+def list_for_document(session: Session, document_id: uuid.UUID) -> list[Review]:
+    """Every decision about one document, oldest first."""
+    return list(session.scalars(
+        select(Review).where(Review.document_id == document_id).order_by(Review.created_at, Review.id)
+    ))
+```
+
+## `pipeline/checkpoint.py` (final)
+`open_pool` uses the app role; `setup_checkpoint_tables` is the one-time owner-role step (`python -m freight_intel.pipeline.checkpoint`). The pool needs `autocommit=True`, `prepare_threshold=0`, `row_factory=dict_row`, or `PostgresSaver` misbehaves.
+```python
+"""Where LangGraph keeps its checkpoints: in Postgres, so a paused review survives a restart.
+
+Two roles, two jobs. Creating the checkpoint tables needs rights the app role deliberately lacks,
+so setup_checkpoint_tables() connects as the OWNER and is run once (like a migration). At runtime
+the API uses the APP role, which can only read and write rows. These tables have no tenant column
+and no row-level security (LangGraph decides their shape), so tenant safety comes from the thread
+id (tenant id + document id) and from the service checking ownership first.
+"""
+from functools import lru_cache
+
+from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg.conninfo import make_conninfo
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+from freight_intel.config import get_settings
+
+# The same connection settings PostgresSaver.from_conn_string uses internally.
+CONNECTION_KWARGS = {"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row}
+
+
+def _conninfo(user: str, password: str) -> str:
+    settings = get_settings()
+    return make_conninfo(
+        host=settings.db_host, port=settings.db_port, dbname=settings.postgres_db,
+        user=user, password=password,
+    )
+
+
+def open_pool(*, max_size: int = 5) -> ConnectionPool:
+    """A pool of database connections as the APP role. The caller closes it."""
+    settings = get_settings()
+    return ConnectionPool(
+        _conninfo(settings.app_db_user, settings.app_db_password),
+        min_size=1, max_size=max_size, kwargs=CONNECTION_KWARGS, open=True,
+    )
+
+
+@lru_cache
+def _shared_pool() -> ConnectionPool:
+    return open_pool()
+
+
+@lru_cache
+def get_checkpointer() -> PostgresSaver:
+    """The saver the API uses: one pool, created on first use, shared by the whole process."""
+    return PostgresSaver(_shared_pool())
+
+
+def close_checkpointer() -> None:
+    """Close the shared pool at shutdown (a no-op if it was never opened)."""
+    if _shared_pool.cache_info().currsize:
+        _shared_pool().close()
+    get_checkpointer.cache_clear()
+    _shared_pool.cache_clear()
+
+
+def setup_checkpoint_tables() -> None:
+    """Create LangGraph's tables as the OWNER role. Safe to run again: it only adds what is missing."""
+    settings = get_settings()
+    with PostgresSaver.from_conn_string(_conninfo(settings.postgres_user, settings.postgres_password)) as saver:
+        saver.setup()
+
+
+if __name__ == "__main__":
+    setup_checkpoint_tables()
+    print("checkpoint tables are ready")
+```
+
+## Day 42 bug found while designing the API: `review_loop`
+Scenario: round 1 the reviewer *corrects* the extraction (still invalid), round 2 *approves*. The approving round carried no extraction, so the earlier correction was lost and downstream code hit `KeyError: 'extraction'`. Reproduced first, then fixed by merging: `return {**latest, **update}`, i.e. keep what an earlier round produced and let the final decision override.
+```python
+"""Human review of a document the pipeline could not settle. Plain functions: no LangGraph, no database.
+
+When validation still finds errors after the retries, a person looks at the extraction and answers with a
+decision. This file says what a valid answer looks like and what each answer does to the state. The graph
+(graph.py) only handles the pausing; the rules live here so they can be tested without it.
+
+A human is not trusted blindly either: a correction goes through the same validate() as the model's reading.
+"""
+from collections.abc import Callable, Mapping
+from dataclasses import asdict, dataclass
+
+from freight_intel.pipeline.schemas import InvoiceExtraction, QuoteExtraction
+from freight_intel.pipeline.validation import validate
+
+ACTIONS = ("approve", "correct", "reject")
+MAX_ROUNDS = 3  # the reviewer gets this many tries; after that the document stays needs_review
+MAX_NOTE_CHARS = 1000
+SCHEMAS = {"quote": QuoteExtraction, "invoice": InvoiceExtraction}
+
+
+@dataclass(frozen=True)
+class Decision:
+    action: str  # approve | correct | reject
+    reviewer: str  # who decided; set by our code from the logged-in user, never by the model
+    note: str = ""
+    extraction: dict | None = None  # "correct" only: the whole corrected extraction, in the model's text shape
+
+
+def parse_decision(raw) -> Decision:
+    """Check what came back from the person. Raises ValueError with a message the person can read."""
+    if not isinstance(raw, Mapping):
+        raise ValueError("the decision must be a JSON object")
+    action = raw.get("action")
+    if action not in ACTIONS:
+        raise ValueError(f"action must be one of: {', '.join(ACTIONS)}")
+    reviewer = str(raw.get("reviewer") or "").strip()
+    if not reviewer:
+        raise ValueError("the reviewer is required")
+    note = str(raw.get("note") or "").strip()
+    if len(note) > MAX_NOTE_CHARS:
+        raise ValueError(f"the note is longer than {MAX_NOTE_CHARS} characters")
+    extraction = raw.get("extraction")
+    if action == "correct":
+        if not isinstance(extraction, Mapping):
+            raise ValueError("a correction must include the corrected extraction")
+        return Decision(action, reviewer, note, dict(extraction))
+    return Decision(action, reviewer, note)
+
+
+def build_review_request(state: Mapping, *, error: str | None = None) -> dict:
+    """What the person is shown: plain JSON-friendly values only (it is saved with the checkpoint)."""
+    request = {
+        "doc_type": state["doc_type"],
+        "extraction": state["extraction"].model_dump(mode="json"),
+        "issues": [asdict(issue) for issue in state.get("issues", [])],
+        "attempts": state.get("attempts", 0),
+    }
+    if error:
+        request["error"] = error
+    return request
+
+
+def apply_decision(state: Mapping, decision: Decision) -> dict:
+    """The state changes one decision causes. Raises ValueError if the decision cannot be applied."""
+    review = {"action": decision.action, "reviewer": decision.reviewer, "note": decision.note}
+    if decision.action == "reject":
+        return {"status": "rejected", "review": review}
+    if decision.action == "approve":
+        still_has_errors = any(issue.severity == "error" for issue in state.get("issues", []))
+        if still_has_errors and not decision.note:
+            raise ValueError("approving a document that still has errors needs a note saying why")
+        return {"status": "reviewed", "review": review}
+    corrected = SCHEMAS[state["doc_type"]].model_validate(decision.extraction)  # ValidationError is a ValueError
+    result = validate(state["doc_type"], corrected)
+    return {
+        "extraction": corrected,
+        "typed": result.typed,
+        "issues": result.issues,
+        "status": "reviewed" if result.ok else "needs_review",
+        "hint": "",
+        "review": review,
+    }
+
+
+def review_loop(state: Mapping, ask: Callable[[dict], object]) -> dict:
+    """Ask until the person gives a usable answer (at most MAX_ROUNDS times). Returns the state update.
+
+    `ask` shows a request and returns the person's raw answer. In the graph it is LangGraph's interrupt();
+    in tests it is a scripted function. This function must be repeatable: after a pause the graph runs it
+    again from the top, and interrupt() hands back the earlier answers in order.
+    """
+    request = build_review_request(state)
+    latest: dict = {}
+    for _ in range(MAX_ROUNDS):
+        raw = ask(request)
+        try:
+            update = apply_decision(state, parse_decision(raw))
+        except ValueError as exc:
+            request = build_review_request(state, error=str(exc)[:500])
+            continue
+        if update["status"] != "needs_review":
+            return {**latest, **update}  # keep what an earlier round corrected: approving means approving THAT reading
+        latest = update  # a correction that still has errors: show what remains and ask again
+        state = {**state, **update}
+        request = build_review_request(state)
+    return {**latest, "status": "needs_review", "error": f"review not completed after {MAX_ROUNDS} attempts"}
+```
+
+---
+
+# Part 3 - The services
+
+## `services/processing.py` (final)
+`process_document` is the background job: claim -> run graph -> save in one transaction; errors never escape (mark `failed`, log). `submit_review` is the human answer: lock the document row, check it is really waiting, resume the graph with `{**decision, "reviewer": str(user_id)}`, then save result + review row atomically.
+```python
+"""Running documents through the pipeline, and handling the people who review them.
+
+Like services/results.py: this layer decides what happens and owns the transactions; it knows nothing
+about HTTP. The routes call it, and turn its exceptions into status codes.
+
+  process_document   the background job after an upload: claim, run the graph, save the result or the pause
+  submit_review      a person answers a paused document: resume the graph, save the result and the review
+  pending_question   what a paused document is waiting to be asked
+
+Two separate stores are involved: the database tables (documents, extractions, reviews) and LangGraph's
+checkpoints (where a paused run waits). They cannot be updated in one transaction. The order below keeps the
+damage small: the database is written only after the graph has moved, in ONE transaction.
+"""
+import logging
+import uuid
+from collections.abc import Mapping
+from dataclasses import asdict, dataclass
+
+from freight_intel.db import tenant_session
+from freight_intel.pipeline import review as review_rules
+from freight_intel.pipeline.checkpoint import get_checkpointer
+from freight_intel.pipeline.graph import (
+    NoPendingReview, build_graph, pending_review, resume_document, review_thread_id, run_document,
+)
+from freight_intel.repositories import documents, reviews
+from freight_intel.services import results
+from freight_intel.storage import get_storage
+
+log = logging.getLogger(__name__)
+
+
+class DocumentNotFound(Exception):
+    """No document with that id in this tenant (another tenant's document looks exactly the same)."""
+
+
+class NotAwaitingReview(Exception):
+    """The document is not waiting for a person: it is finished, still processing, or the review ended."""
+
+
+class InvalidDecision(Exception):
+    """The decision is malformed. The message is written for the person who sent it."""
+
+
+@dataclass(frozen=True)
+class ProcessOutcome:
+    document_status: str  # processed | needs_review | failed
+    awaiting_review: bool
+
+
+@dataclass(frozen=True)
+class ReviewOutcome:
+    accepted: bool  # False: the decision could not be used and NOTHING was saved; see `question["error"]`
+    document_status: str
+    question: dict | None  # what the person must answer next; None when the review is over
+
+
+class _NoLLM:
+    """For graphs that only read or resume a review. If any model step ever ran, fail loudly instead of paying."""
+
+    def extract(self, schema, system, user):
+        raise RuntimeError("this graph is only for reading or resuming a review; it must not call the model")
+
+
+def _review_graph(checkpointer):
+    saver = get_checkpointer() if checkpointer is None else checkpointer
+    return build_graph(_NoLLM(), checkpointer=saver, human_review=True)
+
+
+def process_document(*, tenant_id: uuid.UUID, document_id: uuid.UUID, llm, checkpointer=None, storage=None) -> ProcessOutcome | None:
+    """Read one uploaded document and store the outcome. Meant to run in the background.
+
+    Returns None when someone else already claimed the document (nothing is done twice). Errors inside the
+    pipeline never escape: the document is marked failed and logged, because no request is waiting to hear.
+    """
+    saver = get_checkpointer() if checkpointer is None else checkpointer
+    files = get_storage() if storage is None else storage
+    with tenant_session(tenant_id) as session:
+        document = documents.get(session, document_id)
+        if document is None:
+            raise DocumentNotFound
+        storage_key = document.storage_key
+        if not documents.claim_for_processing(session, document_id):
+            return None
+
+    thread = review_thread_id(tenant_id, document_id)
+    graph = build_graph(llm, checkpointer=saver, human_review=True)
+    try:
+        state = run_document(
+            graph, str(files.path(storage_key)), thread_id=thread, tags=["api"],
+            metadata={"tenant_id": str(tenant_id), "document_id": str(document_id)},
+        )
+        waiting = pending_review(graph, thread) is not None
+        saved = results.save_pipeline_result(tenant_id=tenant_id, document_id=document_id, state=state)
+    except Exception:
+        log.exception("processing document %s failed", document_id)
+        _mark_failed(tenant_id, document_id)
+        return ProcessOutcome("failed", False)
+    return ProcessOutcome(saved.document_status, waiting)
+
+
+def _mark_failed(tenant_id: uuid.UUID, document_id: uuid.UUID) -> None:
+    try:
+        with tenant_session(tenant_id) as session:
+            documents.set_status(session, document_id, "failed")
+    except Exception:
+        log.exception("could not mark document %s as failed", document_id)
+
+
+def pending_question(*, tenant_id: uuid.UUID, document_id: uuid.UUID, checkpointer=None) -> dict | None:
+    """The request a person has to answer for this document, or None if it is not waiting for anyone."""
+    with tenant_session(tenant_id) as session:
+        document = documents.get(session, document_id)
+        if document is None:
+            raise DocumentNotFound
+        waiting = document.status == "needs_review"
+    if not waiting:
+        return None
+    return pending_review(_review_graph(checkpointer), review_thread_id(tenant_id, document_id))
+
+
+def submit_review(
+    *, tenant_id: uuid.UUID, user_id: uuid.UUID, document_id: uuid.UUID, decision: Mapping, checkpointer=None
+) -> ReviewOutcome:
+    """Give a paused document the answer of a logged-in person.
+
+    Who decided is taken from the login (`user_id`), never from the request: a `reviewer` field sent by the
+    client is overwritten. The document row is locked while this runs, so two people answering at the same
+    time are handled one after the other, and the second is told the document is no longer waiting.
+    """
+    try:
+        parsed = review_rules.parse_decision({**decision, "reviewer": str(user_id)})
+    except ValueError as exc:
+        raise InvalidDecision(str(exc)) from exc
+
+    graph = _review_graph(checkpointer)
+    thread = review_thread_id(tenant_id, document_id)
+    with tenant_session(tenant_id) as session:
+        document = documents.get_for_update(session, document_id)
+        if document is None:
+            raise DocumentNotFound
+        if document.status != "needs_review":
+            raise NotAwaitingReview
+        try:
+            state = resume_document(graph, thread, asdict(parsed))
+        except NoPendingReview as exc:
+            raise NotAwaitingReview from exc
+
+        question = pending_review(graph, thread)
+        if question is not None and "error" in question:
+            return ReviewOutcome(False, "needs_review", question)  # unusable answer: it is asked again, nothing saved
+
+        reviews.add(
+            session, tenant_id=tenant_id, document_id=document_id, reviewer_id=user_id, action=parsed.action,
+            note=parsed.note, corrected_data=parsed.extraction if parsed.action == "correct" else None,
+        )
+        if question is None:  # the review is over: store the final reading and status with the review itself
+            document_status = results.apply_pipeline_result(
+                session, tenant_id=tenant_id, document_id=document_id, state=state
+            ).document_status
+        else:  # a correction that still has errors: the person is asked again; the tables keep the last settled reading
+            document_status = "needs_review"
+    return ReviewOutcome(True, document_status, question)
+```
+
+## `services/documents.py` (final)
+What routes read: upload registration, listing, detail (with the open question), and on-demand reconciliation. Reconcile uses only **settled** readings (`ok` or `reviewed`); otherwise `NotSettled` -> 409.
+```python
+"""What the documents API needs, assembled from the repositories and the processing service.
+
+Like the other services: each function owns its transaction and returns plain values (dictionaries and
+dataclasses), never ORM objects, because their attributes expire when the transaction ends. The dictionaries
+are shaped to match the response schemas in schemas/documents.py.
+"""
+import uuid
+
+from freight_intel.db import tenant_session
+from freight_intel.repositories import documents, extractions, reconciliations, reviews
+from freight_intel.services import processing, results
+from freight_intel.services.processing import DocumentNotFound
+from freight_intel.services.uploads import CheckedUpload
+from freight_intel.storage import LocalStorage, get_storage
+
+__all__ = ["DocumentNotFound", "NotReconcilable", "register_upload", "list_documents", "get_document", "reconcile_document"]
+
+
+class NotReconcilable(Exception):
+    """This document cannot be reconciled (yet). The message says why, for the person who asked."""
+
+
+def register_upload(*, tenant_id: uuid.UUID, user_id: uuid.UUID, upload: CheckedUpload, storage=None) -> uuid.UUID:
+    """Store a checked file and add its document row (status uploaded). Returns the new document id.
+
+    The id is chosen first because the storage key is built from it. If the row cannot be saved the file
+    is removed again, so a failed upload leaves nothing behind.
+    """
+    files = get_storage() if storage is None else storage
+    document_id = uuid.uuid4()
+    key = LocalStorage.key_for(tenant_id, document_id, upload.extension)
+    files.save(key, upload.data)
+    try:
+        with tenant_session(tenant_id) as session:
+            documents.create(
+                session, tenant_id=tenant_id, filename=upload.display_name, storage_key=key,
+                uploaded_by=user_id, document_id=document_id,
+            )
+    except Exception:
+        files.delete(key)
+        raise
+    return document_id
+
+
+def list_documents(*, tenant_id: uuid.UUID, limit: int, offset: int = 0) -> list[dict]:
+    with tenant_session(tenant_id) as session:
+        return [_summary(document) for document in documents.list_recent(session, limit=limit, offset=offset)]
+
+
+def get_document(*, tenant_id: uuid.UUID, document_id: uuid.UUID, checkpointer=None) -> dict:
+    """Everything known about one document: status, what was read, findings, review history, open question."""
+    with tenant_session(tenant_id) as session:
+        document = documents.get(session, document_id)
+        if document is None:
+            raise DocumentNotFound
+        view = _summary(document)
+        extraction = extractions.get_for_document(session, document_id)
+        view["extraction"] = _extraction(session, extraction) if extraction else None
+        view["reconciliation"] = _reconciliation(session, extraction) if extraction else None
+        view["reviews"] = [
+            {"action": r.action, "note": r.note, "reviewer_id": r.reviewer_id, "created_at": r.created_at,
+             "corrected": r.corrected_data is not None}
+            for r in reviews.list_for_document(session, document_id)
+        ]
+    view["pending_review"] = (
+        processing.pending_question(tenant_id=tenant_id, document_id=document_id, checkpointer=checkpointer)
+        if view["status"] == "needs_review" else None
+    )
+    return view
+
+
+def reconcile_document(*, tenant_id: uuid.UUID, document_id: uuid.UUID) -> results.ReconcileOutcome:
+    """Compare an invoice document with its quote and store the findings (replacing any earlier ones)."""
+    with tenant_session(tenant_id) as session:
+        if documents.get(session, document_id) is None:
+            raise DocumentNotFound
+        extraction = extractions.get_for_document(session, document_id)
+        if extraction is None or extraction.doc_type != "invoice":
+            raise NotReconcilable("only an invoice that has been read can be reconciled")
+        extraction_id = extraction.id
+    try:
+        return results.reconcile_invoice(tenant_id=tenant_id, invoice_extraction_id=extraction_id)
+    except results.NotSettled as exc:
+        raise NotReconcilable("this invoice is still waiting for a review, or was rejected") from exc
+    except results.InvoiceNotFound as exc:  # it was replaced between the two steps
+        raise NotReconcilable("the invoice changed while it was being reconciled; try again") from exc
+
+
+# --- plain-value builders: call them inside the session ------------------------------------------------
+
+def _summary(document) -> dict:
+    return {
+        "id": document.id, "filename": document.filename, "doc_type": document.doc_type,
+        "status": document.status, "created_at": document.created_at,
+    }
+
+
+def _extraction(session, row) -> dict:
+    return {
+        "id": row.id, "status": row.status, "doc_type": row.doc_type, "reference": row.reference,
+        "quote_reference": row.quote_reference, "doc_date": row.doc_date, "valid_until": row.valid_until,
+        "currency": row.currency, "origin": row.origin, "destination": row.destination,
+        "equipment": row.equipment, "total_minor": row.total_minor, "issues": row.issues,
+        "charges": [
+            {"position": c.position, "code": c.canonical_code, "label": c.raw_label,
+             "amount_minor": c.amount_minor, "known": c.known}
+            for c in extractions.get_charges(session, row.id)
+        ],
+    }
+
+
+def _reconciliation(session, extraction_row) -> dict | None:
+    row = reconciliations.get_for_invoice(session, extraction_row.id)
+    if row is None:
+        return None
+    quote = extractions.get(session, row.quote_extraction_id)
+    return {
+        "id": row.id, "quote_document_id": quote.document_id, "match_method": row.match_method,
+        "currency": row.currency, "total_variance_minor": row.total_variance_minor, "status": row.status,
+        "discrepancies": [
+            {"position": d.position, "type": d.type, "charge_code": d.charge_code, "label": d.label,
+             "quoted_minor": d.quoted_minor, "invoiced_minor": d.invoiced_minor,
+             "variance_minor": d.variance_minor, "note": d.note, "explanation": d.explanation}
+            for d in reconciliations.get_discrepancies(session, row.id)
+        ],
+    }
+```
+
+---
+
+# Part 4 - The HTTP layer
+
+## `schemas/documents.py`
+`ReviewRequest` uses `extra="forbid"`: a client sending its own `reviewer` field is rejected with 422, so identity can only come from the login.
+```python
+"""Request/response shapes for the documents endpoints.
+
+The services hand back plain dictionaries; FastAPI checks them against these schemas on the way out, so the
+shape of every response is written down in one place (and shows up in the /docs page). Money is always an
+integer in minor units (cents), with the currency alongside.
+"""
+import json
+import uuid
+from datetime import date, datetime
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+MAX_CORRECTION_CHARS = 100_000  # a corrected extraction is a few KB; this only stops abuse
+
+
+class DocumentSummary(BaseModel):
+    id: uuid.UUID
+    filename: str
+    doc_type: str  # unknown until it has been read, then quote | invoice | rate_sheet
+    status: str  # uploaded | processing | needs_review | processed | rejected | failed
+    created_at: datetime
+
+
+class UploadResponse(BaseModel):
+    id: uuid.UUID
+    status: str
+
+
+class ChargeOut(BaseModel):
+    position: int
+    code: str  # the canonical charge name, "OTHER" when the label was not recognised
+    label: str  # exactly as printed
+    amount_minor: int | None  # None = the amount could not be read
+    known: bool
+
+
+class ExtractionOut(BaseModel):
+    id: uuid.UUID
+    status: str  # ok | needs_review | reviewed
+    doc_type: str
+    reference: str | None
+    quote_reference: str | None
+    doc_date: date | None
+    valid_until: date | None
+    currency: str | None
+    origin: str | None
+    destination: str | None
+    equipment: str | None
+    total_minor: int | None  # the total as PRINTED on the document
+    issues: list[dict]
+    charges: list[ChargeOut]
+
+
+class DiscrepancyOut(BaseModel):
+    position: int
+    type: str
+    charge_code: str | None
+    label: str | None
+    quoted_minor: int | None
+    invoiced_minor: int | None
+    variance_minor: int | None
+    note: str
+    explanation: str | None
+
+
+class ReconciliationOut(BaseModel):
+    id: uuid.UUID
+    quote_document_id: uuid.UUID
+    match_method: str
+    currency: str | None
+    total_variance_minor: int | None
+    status: str  # clean | has_discrepancies
+    discrepancies: list[DiscrepancyOut]
+
+
+class ReviewOut(BaseModel):
+    action: str
+    note: str
+    reviewer_id: uuid.UUID
+    created_at: datetime
+    corrected: bool  # True when this decision replaced the extracted values
+
+
+class DocumentDetail(DocumentSummary):
+    extraction: ExtractionOut | None
+    reconciliation: ReconciliationOut | None
+    reviews: list[ReviewOut]
+    pending_review: dict | None  # what a person must answer; only while the status is needs_review
+
+
+class ReviewRequest(BaseModel):
+    # extra="forbid": a client that sends its own "reviewer" is told no, instead of being quietly ignored.
+    # Who reviewed is always the logged-in user.
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["approve", "correct", "reject"]
+    note: str = Field(default="", max_length=1000)
+    extraction: dict | None = None  # "correct" only: the whole corrected extraction
+
+    @field_validator("extraction")
+    @classmethod
+    def not_huge(cls, value: dict | None) -> dict | None:
+        if value is not None and len(json.dumps(value)) > MAX_CORRECTION_CHARS:
+            raise ValueError("the corrected extraction is too large")
+        return value
+
+
+class ReviewResponse(BaseModel):
+    document_status: str
+    question: dict | None  # set while the person is asked again; None when the review is over
+
+
+class ReconcileResponse(BaseModel):
+    # reconciled | reference_not_found | ambiguous | no_candidate | route_unknown | unreadable_amount
+    status: str
+    reconciliation_id: uuid.UUID | None
+    discrepancy_count: int
+```
+
+## `api/routes/documents.py`
+Five endpoints. Status mapping: 413 too large, 415 unsupported type, 422 bad input, 404 not found (also for another company's document), 409 wrong state, 503 no OpenAI key (checked **before** storing anything).
+```python
+"""HTTP layer for documents: parse the request, call a service, map errors to status codes."""
+import uuid
+
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, Response, UploadFile, status
+
+from freight_intel.api.deps import CurrentUserDep, LLMDep, SaverDep, StorageDep
+from freight_intel.config import get_settings
+from freight_intel.schemas.documents import (
+    DocumentDetail, DocumentSummary, ReconcileResponse, ReviewRequest, ReviewResponse, UploadResponse,
+)
+from freight_intel.services import documents as documents_service
+from freight_intel.services import processing
+from freight_intel.services.uploads import UploadRejected, check_upload
+
+router = APIRouter(prefix="/documents", tags=["documents"])
+
+MULTIPART_OVERHEAD = 64 * 1024  # a multipart body is a little larger than the file inside it
+UPLOAD_STATUS = {"too_large": 413, "unsupported_type": 415}  # every other rejection is a 422
+
+
+def _not_found() -> HTTPException:
+    return HTTPException(status.HTTP_404_NOT_FOUND, "Document not found")
+
+
+@router.post("", response_model=UploadResponse, status_code=status.HTTP_202_ACCEPTED)
+def upload_document(
+    request: Request, response: Response, file: UploadFile, background: BackgroundTasks,
+    user: CurrentUserDep, llm: LLMDep, saver: SaverDep, storage: StorageDep,
+) -> UploadResponse:
+    """Accept a file, answer 202 at once, and read it in the background. Poll GET /documents/{id} for the result."""
+    limit = get_settings().max_upload_bytes
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit + MULTIPART_OVERHEAD:
+        raise HTTPException(413, "File is too large")
+    data = file.file.read(limit + 1)  # one byte more than allowed, so "too large" can be told from "exactly the limit"
+    try:
+        checked = check_upload(file.filename, data, max_bytes=limit)
+    except UploadRejected as exc:
+        raise HTTPException(UPLOAD_STATUS.get(exc.code, 422), exc.message)
+
+    document_id = documents_service.register_upload(
+        tenant_id=user.tenant_id, user_id=user.user_id, upload=checked, storage=storage
+    )
+    background.add_task(
+        processing.process_document,
+        tenant_id=user.tenant_id, document_id=document_id, llm=llm, checkpointer=saver, storage=storage,
+    )
+    response.headers["Location"] = f"/documents/{document_id}"
+    return UploadResponse(id=document_id, status="uploaded")
+
+
+@router.get("", response_model=list[DocumentSummary])
+def list_documents(
+    user: CurrentUserDep, limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)
+) -> list[dict]:
+    return documents_service.list_documents(tenant_id=user.tenant_id, limit=limit, offset=offset)
+
+
+@router.get("/{document_id}", response_model=DocumentDetail)
+def get_document(document_id: uuid.UUID, user: CurrentUserDep, saver: SaverDep) -> dict:
+    try:
+        return documents_service.get_document(tenant_id=user.tenant_id, document_id=document_id, checkpointer=saver)
+    except documents_service.DocumentNotFound:
+        raise _not_found()
+
+
+@router.post("/{document_id}/review", response_model=ReviewResponse)
+def review_document(document_id: uuid.UUID, body: ReviewRequest, user: CurrentUserDep, saver: SaverDep) -> ReviewResponse:
+    """Answer a document that is waiting for a person: approve it, correct it, or reject it."""
+    try:
+        outcome = processing.submit_review(
+            tenant_id=user.tenant_id, user_id=user.user_id, document_id=document_id,
+            decision=body.model_dump(), checkpointer=saver,
+        )
+    except processing.DocumentNotFound:
+        raise _not_found()
+    except processing.NotAwaitingReview:
+        raise HTTPException(status.HTTP_409_CONFLICT, "This document is not waiting for a review")
+    except processing.InvalidDecision as exc:
+        raise HTTPException(422, str(exc))
+    if not outcome.accepted:  # e.g. an approval over errors without a note; nothing was saved
+        raise HTTPException(422, outcome.question["error"])
+    return ReviewResponse(document_status=outcome.document_status, question=outcome.question)
+
+
+@router.post("/{document_id}/reconcile", response_model=ReconcileResponse)
+def reconcile_document(document_id: uuid.UUID, user: CurrentUserDep) -> ReconcileResponse:
+    """Compare an invoice with its quote. Not finding exactly one safe quote is an outcome, not an error."""
+    try:
+        outcome = documents_service.reconcile_document(tenant_id=user.tenant_id, document_id=document_id)
+    except documents_service.DocumentNotFound:
+        raise _not_found()
+    except documents_service.NotReconcilable as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc))
+    return ReconcileResponse(
+        status=outcome.status, reconciliation_id=outcome.reconciliation_id, discrepancy_count=outcome.discrepancy_count
+    )
+```
+
+## `api/deps.py` and `api/main.py`
+```python
+"""FastAPI dependencies: reusable pieces that routes ask for in their signature.
+
+FastAPI calls these before the route runs and passes the result in.
+(Django: middleware plus `request.user`.)
+"""
+import uuid
+from collections.abc import Iterator
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Annotated
+
+import jwt
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from sqlalchemy.orm import Session
+
+from freight_intel.config import get_settings
+from freight_intel.db import tenant_session
+from freight_intel.pipeline.checkpoint import get_checkpointer
+from freight_intel.pipeline.llm import LLM
+from freight_intel.security import decode_access_token
+from freight_intel.storage import LocalStorage, get_storage
+
+# Reads "Authorization: Bearer <token>" and makes Swagger show an Authorize
+# button. auto_error=False so we return our own 401 instead of its default.
+_bearer = HTTPBearer(auto_error=False)
+
+
+@dataclass(frozen=True)
+class CurrentUser:
+    user_id: uuid.UUID
+    tenant_id: uuid.UUID
+    role: str
+
+
+def _unauthorized() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Not authenticated",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+def get_current_user(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
+) -> CurrentUser:
+    """Turn the bearer token into a CurrentUser, or answer 401.
+
+    The tenant comes from the *signed* token. Never from the request body,
+    query string or headers a client controls.
+    """
+    if credentials is None:
+        raise _unauthorized()
+    try:
+        claims = decode_access_token(credentials.credentials)
+        return CurrentUser(
+            user_id=uuid.UUID(claims["sub"]),
+            tenant_id=uuid.UUID(claims["tid"]),
+            role=claims.get("role", "member"),
+        )
+    except (jwt.PyJWTError, ValueError, KeyError):
+        # Bad signature, expired, malformed, missing claims: one answer for all.
+        raise _unauthorized()
+
+
+def get_db(user: Annotated[CurrentUser, Depends(get_current_user)]) -> Iterator[Session]:
+    """A database session already locked to the caller's tenant.
+
+    Every route that touches data takes this dependency, so a route cannot
+    forget to scope its queries: the database itself enforces it.
+    """
+    with tenant_session(user.tenant_id) as session:
+        yield session
+
+
+# Short aliases so route signatures stay readable.
+CurrentUserDep = Annotated[CurrentUser, Depends(get_current_user)]
+DbSession = Annotated[Session, Depends(get_db)]
+
+
+@lru_cache
+def _openai_llm() -> LLM:
+    """One model client for the whole process, created on first use (so the API starts without an OpenAI key)."""
+    from freight_intel.pipeline.llm import OpenAILLM
+    from freight_intel.pipeline.tracing import configure_tracing
+
+    settings = get_settings()
+    configure_tracing()
+    return OpenAILLM(settings.extraction_model, settings.openai_api_key)
+
+
+def get_llm() -> LLM:
+    """The model client. Answers 503 when no OpenAI key is configured, before any file is stored."""
+    if not get_settings().openai_api_key:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Document reading is not configured on this server")
+    return _openai_llm()
+
+
+def get_saver() -> BaseCheckpointSaver:
+    """Where paused reviews are kept. Tests replace this with an in-memory saver."""
+    return get_checkpointer()
+
+
+LLMDep = Annotated[LLM, Depends(get_llm)]
+SaverDep = Annotated[BaseCheckpointSaver, Depends(get_saver)]
+StorageDep = Annotated[LocalStorage, Depends(get_storage)]
+```
+```python
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+
+from freight_intel.api.routes import auth, documents, health, users
+from freight_intel.pipeline.checkpoint import close_checkpointer
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    yield
+    close_checkpointer()  # at shutdown: close the connections that hold paused reviews
+
+
+def create_app() -> FastAPI:
+    """App factory: tests and uvicorn both build the app the same way."""
+    app = FastAPI(title="FreightLens API", lifespan=lifespan)
+    app.include_router(health.router)
+    app.include_router(auth.router)
+    app.include_router(users.router)
+    app.include_router(documents.router)
+    return app
+
+
+app = create_app()
+```
+
+`pyproject.toml` gained `langgraph-checkpoint-postgres>=3.0` and `python-multipart>=0.0.9` (FastAPI needs the latter to read file uploads).
+
+---
+
+# Part 5 - Tests, decisions, limits
+
+## Tests (241 -> 299)
+| File | What it proves |
+|---|---|
+| `test_checkpoint.py` (2) | a pause survives a brand-new pool + saver + graph; the app role cannot `CREATE TABLE` |
+| `test_review.py`, `test_result_mapping.py` (added) | earlier correction survives a later approval; `reviewed -> processed`, `rejected -> rejected` |
+| `test_persistence.py` (added) | claim runs once; other tenant cannot claim; listing shows only your documents; review is atomic; cross-tenant reviewer refused; `correct` needs data; `NotSettled` |
+| `test_processing.py` (14) | background job outcomes, failure marking, resume, rejection, wrong state |
+| `test_documents_service.py` (7) | upload registration, detail, reconcile rules |
+| `test_documents_api.py` (25) | every endpoint, status codes, size/type limits, 503 without key, reviewer from login, cross-tenant 404 |
+
+## Bugs and gotchas learned
+1. **JSON null vs SQL NULL** - `corrected_data=None` was stored as JSON `null`, so approve rows broke the CHECK and a "correct without data" test did not raise. Fix: `JSONB(none_as_null=True)`; no migration change, `alembic check` stays clean.
+2. **DetachedInstanceError** - an ORM object is unusable after its session commits. Return plain values (ids, strings) out of a `with` block, or read them inside it.
+3. **Lost correction** (Day 42 code) - see Part 2.
+4. **`PostgresSaver.setup()` needs the owner role** - the app role has no `CREATE`. In deploy this becomes a release step, not application start-up.
+5. **Never run the pool in `autocommit=False`** with `PostgresSaver`; it expects autocommit and `prepare_threshold=0`.
+
+## Decisions
+- Reconcile on demand via `POST`, not automatically after a review.
+- Statuses added: document `rejected`, extraction `reviewed`.
+- BackgroundTasks now, queue later.
+- Reviewer identity from the login only.
+
+## Known limits (write these in the README/interview answer, they are honest)
+- Server killed mid-processing leaves the document in `processing`.
+- A review that fails 3 corrections in a row ends with the document `needs_review` and no open question; workaround: upload again.
+- Database failure after the graph moved cannot be resumed with the same answer.
+- Correction payload capped at 100,000 JSON characters; the reverse-proxy body limit is set at deploy time.
+- `uploaded_by` foreign key is plain, not composite.
+- Test fixtures are duplicated across files (possible conftest clean-up).
+
+---
+
+# Self-check questions
+1. Why does `POST /documents` answer `202` and not `200`? What does the client do next?
+2. Two workers pick up the same document at the same instant. What stops both from processing it?
+3. Why is `reviewer` taken from the login instead of the request body? What does `extra="forbid"` do for this?
+4. The LangGraph checkpoint tables have no row-level security. Name the two things that keep company A from resuming company B's document.
+5. Why is the database written *after* the graph resumes, and in one transaction?
+6. A client sends a 2 GB upload. At which two points is it stopped, and with which status code?
+7. Why does reconcile refuse a quote whose extraction is `needs_review`? Which statuses count as settled?
+8. What was the JSON `null` bug, and how did the fix avoid a new migration?
+9. Why must `setup()` run as the owner role and not the app role? How does a test prove the app role is restricted?
+10. Name two things that can still go wrong with BackgroundTasks, and what you would use in production instead.
+
+## Answer key
+1. The work is not finished when the response is sent. The client keeps the id (also in `Location`) and polls `GET /documents/{id}` until the status is `processed`, `needs_review`, or `failed`.
+2. The atomic `UPDATE ... WHERE status='uploaded'`. Only one gets `rowcount == 1`; the other returns `None` and does nothing.
+3. A client can claim to be anyone. The login (JWT) is the only trustworthy identity. `extra="forbid"` turns a sent `reviewer` field into a 422.
+4. The tenant id inside the `thread_id`, and the service's ownership check against the RLS-protected `documents` table before touching the graph.
+5. If the graph moved but nothing is saved, the answer is lost; writing the tables only after the graph succeeded, in one transaction, means the result and the audit row appear together or not at all.
+6. Early: `Content-Length` larger than the limit -> 413 before reading. Late: the body is read with a limit of limit+1 bytes -> 413 (covers a missing/lying header).
+7. A `needs_review` reading may be wrong; reconciling it would produce confident but false findings. Settled = `ok` or `reviewed`.
+8. `None` was stored as JSON `null` (a value), not SQL `NULL`, breaking the `(action='correct') = (corrected_data IS NOT NULL)` check. `JSONB(none_as_null=True)` changes only the Python-side mapping.
+9. Creating tables is DDL; the app role has DML only (least privilege). `test_checkpoint.py` connects as the app role and asserts that `CREATE TABLE` fails.
+10. The work is lost on restart (document stuck in `processing`), and it competes with request handling in the same process. Use a queue (SQS) plus a separate worker, with a sweeper that resets stale `processing` rows.
+
+# Experiments to try
+1. Start the API without `OPENAI_API_KEY` and POST a file: expect 503 and no new row in `documents`.
+2. Upload a document, kill uvicorn while it is `needs_review`, restart, and `POST .../review`: the pause survived.
+3. Send a review body with a `"reviewer"` field: expect 422.
+4. Log in as a second company and `GET /documents/<first company's id>`: expect 404, not 403.
+5. In `psql`, `SELECT action, corrected_data IS NULL FROM reviews;` after an approve and a correct.
+
+# Commands cheat sheet
+```
+alembic upgrade head
+alembic check
+python -m freight_intel.pipeline.checkpoint     # one-time, owner role
+pytest -q                                        # 299 passed
+uvicorn freight_intel.api.main:app --reload
+```
