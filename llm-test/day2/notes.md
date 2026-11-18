@@ -197,5 +197,86 @@ Reasoning: 0.75 is the middle of the gap between the highest real question (0.68
 7. Why did we choose 0.75 (the middle of the gap) instead of 0.70 (the lowest perfect value in the sweep)?
 8. What is the difference between what the gate checks and what the model must check?
 
-## Still to do (Part C, next session)
-Update `run_eval.py` for v1 (refuse cases, categories); run the LLM-judged eval 3 times for run-to-run noise and set `REGRESSION_THRESHOLD` from it; check that the model declines near-topic and injection questions; stretch: judge calibration with Cohen's kappa; photo + follow-up set; freeze baseline v1 (`eval_results/baselines/`, git tag).
+## Part C - Done on Wed 18 Nov (see below)
+
+---
+
+## Part C - Concepts: can we trust the LLM-judged scores?
+(Demo script: `judge_demo.py` in this folder.)
+
+### 1. Run-to-run noise
+The same code on the same questions gives different scores, because the bot's wording changes and the judge's verdicts change.
+Measure it: run the eval several times without changing anything and take the **standard deviation** of the run averages.
+
+### 2. The regression threshold must be bigger than the noise
+- Smaller than the noise: false alarms on unchanged code, and people learn to ignore the alarm.
+- Much bigger: real regressions slip through.
+- Rule of thumb: **2-3 x the standard deviation** of the run average. More questions make the average steadier.
+
+### 3. LLM-as-judge biases
+Self-preference (same model family as the generator: our setup), verbosity bias, scale drift on 1-5 scales (yes/no rubrics are steadier), position bias in A/B comparisons. A judge's score is itself a measurement that needs checking.
+
+### 4. Cohen's kappa (agreement beyond chance)
+`kappa = (observed agreement - chance agreement) / (1 - chance agreement)`, chance = `human_yes * judge_yes + human_no * judge_no`.
+Demo: 85% raw agreement but 71% expected by chance -> kappa 0.48 (moderate). Report kappa next to raw agreement.
+Rough scale: 0.41-0.60 moderate, 0.61-0.80 substantial, above 0.80 almost perfect.
+
+### 5. Rubrics make judges reliable
+A judge is only as good as its definition. Give explicit examples on both sides of the line (what counts and what does not).
+
+**Interview one-liner:** "LLM-judged scores are noisy, so I run the eval several times to measure the run-to-run spread and set the regression threshold above it. I also check the judge against human labels with Cohen's kappa, because raw agreement is inflated when one label dominates."
+
+---
+
+## Part C - What we built
+| File | Change |
+|---|---|
+| `src/evaluation/prompts.py` | `refusal_check_prompt()`: "did the assistant decline?" with a rubric (an honest "no" is an answer; "I have no information" is a decline) |
+| `src/evaluation/metrics.py` | `RefusalVerdict` + `refusal_check()` (structured output, gpt-4o-mini) |
+| `src/evaluation/run_eval.py` | Rewritten for v1: answer scores for the 68 answerable questions, a decline check on all 84 (gate or model) scored with `behaviour_metrics.py`, per-category tables, details only when something looks wrong, results saved to `eval_results/llm_<time>.json`, `--compare-baseline` off by default and now says when nothing regressed |
+| `src/evaluation/regression.py` | Reads the frozen baseline `eval_results/baselines/v1.json`; `REGRESSION_THRESHOLD` 0.1 -> **0.04** with the evidence in the docstring; never writes a baseline; a missing metric fails loudly |
+| `tests/test_regression.py` | 6 tests (noise ignored, real drops caught, every drop reported, improvements never flagged, missing metric errors, threshold pinned): 167 tests in total |
+| `.gitignore` | `eval_results/*` ignored except `eval_results/baselines/` (ignore the contents, not the folder, so `!` can re-include) |
+| `eval_results/baselines/v1.json` + `v1/` | The frozen reference: retrieval, refusal gate, LLM means and standard deviations of 4 runs, declines; plus the 6 raw run files as evidence |
+
+## Part C - Results
+
+### First run: reading the answers found three judge problems
+1. **Refusal judge mistook "no" for declining** (edge-01 muddy boots, edge-03 opened filter, gap-05 stew): correct answers marked as declines. Fixed the rubric with product and policy "no" examples ("Telling the customer no IS answering them") and a spot-check on 6 saved answers before the long runs. Caveat: the rubric was tuned on the answers it then scored, so it should be re-checked on a fresh sample (kappa step).
+2. **Context-recall judge marks known-gap questions "not enough"** (known_gap recall 0.571): no document can prove the store does not sell kayaks. A limit of the metric for "absence" questions, not a search failure (recall@5 was 1.0).
+3. **Faithfulness judge doubts correct totals** (multi-03 $83 = 44 + 39, multi-08 $797 = 249 + 219 + 329: both correct, scored 0.33 and 0.67): the calculator returns only "Subtotal: $83.00" without item names. Possible improvement: the calculator lists what it added.
+
+### Noise: 4 runs, same code
+| Metric | Mean | Standard deviation | Lowest-highest |
+|---|---|---|---|
+| Faithfulness | 0.977 | 0.011 | 0.965-0.988 |
+| Answer relevancy | 0.978 | 0.009 | 0.968-0.988 |
+| Context precision (files) | 0.969 | 0.009 | 0.956-0.978 |
+| Context recall (judge) | 0.923 | 0.007 | 0.912-0.926 |
+
+- Averages are steady (largest gap 0.024). Single questions are not: 15 of 68 changed faithfulness between runs; only 7 of 68 answers had the same text every time. **Never judge a change by one question's LLM score.**
+- **Declining:** all 16 should-refuse questions declined in every run (recall 1.000): near-topic and inj-03 by the model, the rest by the gate. False refusals: `code-01` every run (search cannot find product codes) and `gap-01` "Do you sell kayaks?" in 2 of 3 runs (the bot itself sometimes answers "No, we don't sell kayaks" and sometimes "I don't have information about that").
+
+### Decision: REGRESSION_THRESHOLD 0.1 -> 0.04
+3 x the largest standard deviation (0.011) is about 0.03; 0.04 adds margin because 4 runs give only a rough noise estimate. Check: all 4 unchanged runs pass ("no regressions"), while a drop of 0.04-0.09 (3-6 questions getting worse) is now caught; the old 0.1 was ten times the noise.
+
+## Part C - Lessons
+- **Read the answers before trusting the score.** Three "failures" were judge mistakes; the numbers alone would have been wrong.
+- **Fix the measuring tool before measuring its noise.** Noise must be measured with the final judge.
+- **A check should always say what it concluded** ("no regressions"), so silence never hides a skipped check.
+- **Never let a gate save its own baseline.** Freezing a baseline is a deliberate step.
+- Bot improvements noticed (not done yet): decline near-topic questions with a clear "that's outside what I help with" instead of "I don't have information"; answer "do you sell X?" consistently; mention stock 0 when pricing (multi-08: SummitCarry has 0 in stock).
+
+## Self-check questions (Part C)
+1. Why can the same code give faithfulness 0.965 in one run and 0.988 in the next?
+2. Why must the regression threshold be larger than the run-to-run standard deviation? What goes wrong if it is much larger?
+3. 85% raw agreement sounds high. Why can kappa still be only 0.48?
+4. Why did we fix the refusal judge before running the noise measurement?
+5. Why is the baseline the mean of 4 runs rather than one run?
+6. Why is "the regression check printed nothing" a problem, and how did we fix it?
+7. Why is known_gap context recall 0.571 not a sign that the search is broken?
+
+## Still to do
+- README: noise, threshold and baseline section; then commit and tag `eval-baseline-v1`.
+- Stretch (later): judge calibration with Cohen's kappa on 20-30 hand-labelled answers and a second judge model; photo + follow-up set from `docs/demo-photos/README.md`; update `ab_test.py` for v1 (it still runs all 84 questions, including refuse cases).
+- Next: Day 3, hybrid search (BM25 + RRF), compared against baseline v1.
